@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Resume Insight Pro+ - Analysis Result</title>
+  
+  <!-- Google Fonts -->
+  <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;700&display=swap" rel="stylesheet">
+
+  <!-- CSS Styles -->
+  <style>
+    :root {
+      --primary-color: #3498DB;
+      --secondary-color: #2C3E50;
+      --background-light: #f8f9fa;
+      --background-dark: #1e1e2f;
+      --text-light: #ffffff;
+      --text-dark: #2C3E50;
+      --card-light: #ffffff;
+      --card-dark: #2b2b3d;
+    }
+
+    body {
+      font-family: 'Roboto', sans-serif;
+      background-color: var(--background-light);
+      color: var(--text-dark);
+      margin: 0;
+      padding: 0;
+      transition: all 0.3s ease;
+    }
+
+    body.dark-mode {
+      background-color: var(--background-dark);
+      color: var(--text-light);
+    }
+
+    header {
+      text-align: center;
+      padding: 30px 20px 10px 20px;
+    }
+
+    header h1 {
+      font-size: 3rem;
+      margin-bottom: 10px;
+      color: var(--secondary-color);
+      transition: color 0.3s ease;
+    }
+
+    body.dark-mode header h1 {
+      color: var(--text-light);
+    }
+
+    .toggle-dark, .voice-btn, .home-btn {
+      cursor: pointer;
+      background-color: var(--primary-color);
+      color: #fff;
+      border: none;
+      padding: 8px 15px;
+      border-radius: 8px;
+      font-weight: bold;
+      position: absolute;
+      top: 20px;
+      transition: 0.3s ease;
+    }
+
+    .toggle-dark { right: 20px; }
+    .voice-btn { right: 150px; background: #27ae60; }
+    .home-btn { left: 20px; background: #8e44ad; }
+
+    .toggle-dark:hover, .voice-btn:hover, .home-btn:hover {
+      transform: scale(1.05);
+    }
+
+    .container {
+      max-width: 900px;
+      margin: auto;
+      padding: 20px;
+    }
+
+    .card {
+      background-color: var(--card-light);
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 20px;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+      transition: all 0.3s ease;
+    }
+
+    body.dark-mode .card {
+      background-color: var(--card-dark);
+    }
+
+    /* Circular Score */
+    .score-circle {
+      width: 160px;
+      height: 160px;
+      border-radius: 50%;
+      border: 10px solid var(--primary-color);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: auto;
+      font-size: 2rem;
+      font-weight: bold;
+      animation: growCircle 1.5s ease forwards;
+    }
+
+    @keyframes growCircle {
+      from { transform: scale(0.5); opacity: 0; }
+      to { transform: scale(1); opacity: 1; }
+    }
+
+    .section-scores div {
+      margin-bottom: 15px;
+    }
+
+    .progress-bar {
+      background-color: var(--primary-color);
+      height: 20px;
+      border-radius: 10px;
+      width: 0%;
+      transition: width 1s ease;
+    }
+
+    .feedback-card {
+      background-color: #F4F6F6;
+      padding: 15px;
+      border-radius: 10px;
+      margin-bottom: 10px;
+      animation: slideUp 0.6s ease forwards;
+      transition: 0.3s ease;
+    }
+
+    .feedback-card:hover {
+      transform: translateY(-4px) scale(1.02);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+    }
+
+    body.dark-mode .feedback-card {
+      background-color: #3a3a4e;
+    }
+
+    .keywords-chart {
+      margin-top: 15px;
+    }
+
+    a.button-custom {
+      display: inline-block;
+      text-decoration: none;
+      background-color: var(--primary-color);
+      color: #fff;
+      padding: 10px 25px;
+      border-radius: 8px;
+      font-weight: bold;
+      transition: all 0.3s ease;
+      margin-right: 10px;
+    }
+
+    a.button-custom:hover {
+      background-color: #2980B9;
+    }
+
+    /* Animations */
+    @keyframes fadeIn { from {opacity:0;} to {opacity:1;} }
+    @keyframes slideUp { from {opacity:0; transform: translateY(20px);} to {opacity:1; transform: translateY(0);} }
+
+    /* Advanced Result Container Animation */
+    .result-container {
+      animation: fadeIn 1.2s ease-out both;
+      padding: 20px;
+      background: rgba(255, 255, 255, 0.95);
+      border-radius: 12px;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+    }
+
+    /* Enhance button animations */
+    a.button-custom {
+      transition: transform 0.3s ease, background-color 0.3s ease;
+    }
+    a.button-custom:hover {
+      transform: scale(1.05);
+    }
+
+    /* (Optional) Additional fadeIn keyframe if not already defined */
+    @keyframes fadeIn {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+
+    /* Responsive */
+    @media(max-width: 600px) {
+      header h1 { font-size: 2rem; }
+      .score-circle { width: 120px; height: 120px; font-size: 1.5rem; }
+    }
+  </style>
+</head>
+<body>
+  <button class="home-btn" onclick="window.location.href='index.html'">🏠 Home</button>
+  <button class="voice-btn" onclick="speakResult()">🔊 Narrate</button>
+  <button class="toggle-dark" onclick="toggleDarkMode()">🌙 Dark Mode</button>
+  
+  <header>
+    <h1>Resume Insight Pro+</h1>
+    <p>Your AI-powered resume analysis result</p>
+  </header>
+
+  <div class="container result-container">
+    <!-- Overall Score -->
+    <div class="card">
+      <div class="score-circle" id="overall-score">85%</div>
+    </div>
+
+    <!-- Section-wise Scores -->
+    <div class="card section-scores">
+      <h2>Section-wise Scores</h2>
+      <div>
+        <b>Experience:</b>
+        <div class="progress-bar" id="exp-bar"></div>
+      </div>
+      <div>
+        <b>Education:</b>
+        <div class="progress-bar" id="edu-bar"></div>
+      </div>
+      <div>
+        <b>Skills:</b>
+        <div class="progress-bar" id="skills-bar"></div>
+      </div>
+      <div>
+        <b>Projects:</b>
+        <div class="progress-bar" id="proj-bar"></div>
+      </div>
+    </div>
+
+    <!-- Feedback -->
+    <div class="card">
+      <h2>Feedback</h2>
+      <div class="feedback-card">Add more relevant technical skills.</div>
+      <div class="feedback-card">Experience section is limited, expand your projects.</div>
+    </div>
+
+    <!-- Keyword Match -->
+    <div class="card keywords-chart">
+      <h2>Keyword Match</h2>
+      <div id="keywords-bars"></div>
+    </div>
+
+    <!-- Actions -->
+    <div class="card">
+      <a href="#" class="button-custom">⬇ Download Feedback</a>
+      <a href="index.html" class="button-custom">🔄 Analyze Another</a>
+    </div>
+  </div>
+
+  <!-- JS Scripts -->
+  <script>
+    // Dark Mode Toggle
+    function toggleDarkMode() {
+      document.body.classList.toggle('dark-mode');
+    }
+
+    // Animate Section Progress Bars
+    const sections = {
+      "exp-bar": 80,
+      "edu-bar": 90,
+      "skills-bar": 75,
+      "proj-bar": 85
+    };
+
+    for (const id in sections) {
+      const bar = document.getElementById(id);
+      setTimeout(() => { bar.style.width = sections[id] + "%"; }, 500);
+    }
+
+    // Keyword Match Chart Example
+    const keywords = {
+      "data": 70,
+      "engineering": 50,
+      "python": 85,
+      "aws": 40
+    };
+    const container = document.getElementById("keywords-bars");
+    for (const kw in keywords) {
+      const div = document.createElement("div");
+      div.style.marginBottom = "10px";
+      div.innerHTML = `<b>${kw}:</b> <div class="progress-bar" style="width:0%" data-width="${keywords[kw]}%"></div>`;
+      container.appendChild(div);
+    }
+
+    // Animate keyword bars
+    setTimeout(() => {
+      document.querySelectorAll("#keywords-bars .progress-bar").forEach(bar => {
+        bar.style.width = bar.getAttribute("data-width");
+      });
+    }, 500);
+
+    // Voice Narration
+    function speakResult() {
+      const score = document.getElementById("overall-score").innerText;
+      const feedbacks = [...document.querySelectorAll(".feedback-card")].map(f => f.innerText).join(" ");
+      const message = `Your overall resume score is ${score}. Key feedback: ${feedbacks}`;
+      const utterance = new SpeechSynthesisUtterance(message);
+      utterance.rate = 1;
+      utterance.pitch = 1;
+      utterance.voice = speechSynthesis.getVoices().find(v => v.lang.includes("en"));
+      speechSynthesis.speak(utterance);
+    }
+  </script>
+</body>
+</html>

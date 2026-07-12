@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="history-section">
+  <h2>📂 Past Analyses</h2>
+  <table class="history-table">
+    <thead>
+      <tr>
+        <th>Filename</th>
+        <th>Score</th>
+        <th>Date</th>
+        <th>Action</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for record in history %}
+      <tr>
+        <td>{{ record.filename }}</td>
+        <td>{{ record.score }}%</td>
+        <td>{{ record.date }}</td>
+        <td><a href="result.html?file={{ record.filename }}" class="btn small-btn">View</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

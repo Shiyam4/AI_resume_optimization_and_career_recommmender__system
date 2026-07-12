@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="upload-section">
+  <h2>📂 Upload Resume for Analysis</h2>
+  <form action="/analyze" method="post" enctype="multipart/form-data" class="upload-form">
+    <label for="resume">Choose Resume (PDF/DOCX):</label>
+    <input type="file" id="resume" name="resume" required>
+
+    <label for="jobdesc">Paste Job Description:</label>
+    <textarea id="jobdesc" name="jobdesc" rows="6" placeholder="Paste the job description here..."></textarea>
+
+    <button type="submit" class="btn primary-btn">Analyze</button>
+  </form>
+</section>
+{% endblock %}
