@@ -1,1052 +1,1018 @@
-import streamlit as st
-from pathlib import Path
-from docx import Document
-import PyPDF2
-import re
-from collections import Counter
-try:
-    from textstat import flesch_reading_ease
-    _TEXTSTAT_AVAILABLE = True
-except Exception:
-    _TEXTSTAT_AVAILABLE = False
-    # Fallback implementation of Flesch Reading Ease (approximate)
-    import string
-
-    def _count_syllables(word: str) -> int:
-        word = word.lower().strip().strip(string.punctuation)
-        if len(word) <= 3:
-            return 1
-        vowels = "aeiouy"
-        count = 0
-        prev_was_vowel = False
-        for ch in word:
-            is_vowel = ch in vowels
-            if is_vowel and not prev_was_vowel:
-                count += 1
-            prev_was_vowel = is_vowel
-        # Subtract silent 'e'
-        if word.endswith("e") and count > 1:
-            count -= 1
-        return max(1, count)
-
-    def flesch_reading_ease(text: str) -> float:
-        # Very small approximate implementation to avoid hard dependency on textstat
-        if not text or not text.strip():
-            return 0.0
-
-        sentences = re.split(r'[.!?]+', text)
-        sentences = [s.strip() for s in sentences if s.strip()]
-        words = re.findall(r"\b\w+\b", text)
-        if not words or not sentences:
-            return 0.0
-
-        total_words = len(words)
-        total_sentences = max(1, len(sentences))
-        total_syllables = sum(_count_syllables(w) for w in words)
-
-        # Flesch Reading Ease formula
-        asl = total_words / total_sentences
-        asw = total_syllables / total_words
-        score = 206.835 - (1.015 * asl) - (84.6 * asw)
-        try:
-            return float(score)
-        except Exception:
-            return 0.0
-from wordcloud import WordCloud
-import matplotlib.pyplot as plt
+import datetime as dt
 import base64
+import difflib
+import html
+import io
 import json
-import time
-import datetime
-import io 
+import os
+import re
 import tempfile
-import os 
+from collections import Counter
+from pathlib import Path
 
-# Text-to-speech: try pyttsx3; fallback handled at runtime
-_PYTTSX3_AVAILABLE = False
-_GTTS_AVAILABLE = False
+import matplotlib.pyplot as plt
+import PyPDF2
+import streamlit as st
+from docx import Document
+from wordcloud import WordCloud
 
 try:
     import pyttsx3
-    _PYTTSX3_AVAILABLE = True
+    TTS_AVAILABLE = True
 except Exception:
-    # Fallback to gTTS if pyttsx3 isn't available
-    try:
-        from gtts import gTTS
-        _GTTS_AVAILABLE = True
-    except Exception:
-        pass
+    TTS_AVAILABLE = False
+try:
+    from gtts import gTTS
+    GTTS_AVAILABLE = True
+except Exception:
+    GTTS_AVAILABLE = False
 
-# ==================================================
-# Config & Session State Initialization
-# ==================================================
-st.set_page_config(
-    page_title="Resume Insight Pro+",
-    page_icon="📄",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+try:
+    from textstat import flesch_reading_ease
+except Exception:
+    def flesch_reading_ease(text):
+        words = re.findall(r"\b\w+\b", text)
+        sentences = [item for item in re.split(r"[.!?]+", text) if item.strip()]
+        if not words or not sentences:
+            return 0
+        syllables = sum(max(1, len(re.findall(r"[aeiouy]+", word.lower()))) for word in words)
+        return 206.835 - 1.015 * len(words) / len(sentences) - 84.6 * syllables / len(words)
 
-# Initialize Session State for persistent data (FIX for TTS re-run)
-if 'metric_class' not in st.session_state:
-    st.session_state['metric_class'] = '' 
-if 'tts_audio_bytes' not in st.session_state:
-    st.session_state['tts_audio_bytes'] = None
-if 'tts_format' not in st.session_state:
-    st.session_state['tts_format'] = 'audio/mp3'
 
-# ==================================================
-# Inject Custom CSS (Placeholder for external file content)
-# ==================================================
-def load_css(file_name="style.css"):
-    # Mock CSS loading since 'style.css' is not provided
-    css_code = """
-    /* Main Layout */
-    .section-scores { 
-        padding: 15px; 
-        border-radius: 8px; 
-        background-color: #f0f2f6; 
-        margin-bottom: 20px;
-    }
-    .stSpinner > div {
-        text-align: center;
-    }
+st.set_page_config(page_title="Resume Insight", page_icon="✨", layout="wide", initial_sidebar_state="expanded")
 
-    /* Animated Score Chart CSS */
-    .chart-container {
-        display: flex;
-        justify-content: center;
-        align-items: center;
-        overflow: hidden; /* Important for the sliding effect */
-    }
-    
-    /* 1. Metric Flash Animation */
-    @keyframes metric-flash {
-        0% { background-color: transparent; }
-        50% { background-color: #d1e7dd; } /* Light success color */
-        100% { background-color: transparent; }
-    }
-    .metric-container {
-        padding: 10px;
-        border-radius: 8px;
-        transition: background-color 0.3s ease;
-    }
-    .metric-flash {
-        animation: metric-flash 0.8s ease-out 2; /* Flash twice */
-    }
+SKILLS = ["python", "sql", "excel", "aws", "tableau", "power bi", "spark", "pandas", "numpy", "java", "c++", "javascript", "react", "docker", "git", "machine learning"]
+ACTION_VERBS = ["achieved", "analyzed", "built", "collaborated", "created", "delivered", "designed", "developed", "improved", "implemented", "increased", "launched", "led", "managed", "optimized", "reduced"]
+STOP_WORDS = {"about", "after", "against", "along", "also", "and", "are", "been", "business", "candidate", "candidates", "company", "data", "for", "from", "have", "into", "join", "looking", "our", "role", "skills", "team", "that", "the", "this", "through", "with", "will", "work", "years", "your"}
 
-    /* 2. Custom Animated Progress Bar */
-    .progress-bar-container {
-        width: 100%;
-        background-color: #e0e0e0;
-        border-radius: 4px;
-        margin-bottom: 10px;
-        overflow: hidden;
-    }
-    .progress-bar-fill {
-        height: 15px;
-        background-color: #4CAF50; /* Default green */
-        width: 0;
-        transition: width 1.5s ease-out; /* Animation effect */
-        border-radius: 4px;
-    }
-    .progress-bar-fill.warning {
-        background-color: #FFC107;
-    }
-    .progress-bar-fill.danger {
-        background-color: #F44336;
-    }
+HISTORY_PATH = Path("temp_uploads") / "history.json"
+HISTORY_PATH.parent.mkdir(exist_ok=True)
+if not HISTORY_PATH.exists():
+    HISTORY_PATH.write_text("[]", encoding="utf-8")
 
-    /* 3. Resume Preview Styling */
-    .resume-preview-container {
-        background: white;
-        border: 2px solid #e0e0e0;
-        border-radius: 8px;
-        padding: 30px;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-        max-width: 100%;
-        font-family: 'Calibri', 'Arial', sans-serif;
-        line-height: 1.5;
-        color: #333;
-    }
 
-    .resume-preview-container h1 {
-        font-size: 24px;
-        margin-bottom: 5px;
-        color: #2C3E50;
-        font-weight: bold;
-    }
+def inject_styles():
+    st.markdown("""
+    <style>
+      .stApp { background: #f7f8fc; color: #172033; }
+      [data-testid="stSidebar"] { background: #101a35; }
+      [data-testid="stSidebar"] * { color: #f7f9ff !important; }
+      [data-testid="stSidebar"] .stRadio label { border-radius: 10px; padding: 9px 10px; margin: 3px 0; font-weight: 700; opacity: 1 !important; }
+      [data-testid="stSidebar"] .stRadio label:has(input:checked) { background: #3659b8; box-shadow: inset 3px 0 0 #78ebd8; }
+      .block-container { max-width: 1280px; padding-top: 2rem; padding-bottom: 3rem; overflow: visible !important; }
+      section.main > div, .stApp, .stApp > div, [data-testid="stAppViewContainer"], [data-testid="stVerticalBlock"], [data-testid="stHorizontalBlock"], [data-testid="stColumn"], [data-testid="stTabPanel"], [data-baseweb="tab-panel"], [data-baseweb="tab-list"], .stTabs, .stTabs > div { overflow: visible !important; }
+      [data-testid="stVerticalBlock"], [data-testid="stHorizontalBlock"], [data-testid="stColumn"] { position: relative; z-index: 1; }
+      h1, h2, h3 { letter-spacing: -0.035em; }
+      div[data-testid="stMetric"] { background: white; border: 1px solid #e7eaf2; border-radius: 14px; padding: 14px 16px; box-shadow: 0 6px 22px rgba(25, 38, 73, .045); }
+      .hero { padding: 38px 42px; border-radius: 22px; color: #fff; background: radial-gradient(circle at 88% 12%, #57d4c2 0, transparent 29%), linear-gradient(120deg,#172a5a,#3659b8); box-shadow: 0 16px 36px rgba(31, 57, 125, .22); }
+      .hero h1 { font-size: 2.7rem; margin: 0 0 8px; color: white; }
+      .hero p { font-size: 1.1rem; margin: 0; opacity: .88; }
+      .eyebrow { color: #78ebd8; text-transform: uppercase; letter-spacing: .12em; font-weight: 700; font-size: .76rem; }
+      .feature-card, .insight-card { background: #fff; border: 1px solid #e7eaf2; border-radius: 16px; padding: 20px; height: 100%; box-sizing: border-box; }
+      .feature-card h3, .insight-card h3 { margin: 0 0 7px; font-size: 1.02rem; }
+      .feature-card p, .insight-card p { color: #667085; margin: 0; line-height: 1.5; }
+      .step { display:flex; gap:12px; align-items:center; padding: 14px 0; border-bottom: 1px solid #edf0f5; }
+      .step:last-child { border-bottom:0; }
+      .step-num { flex: 0 0 30px; height:30px; border-radius:50%; background:#e8edff; color:#3659b8; text-align:center; line-height:30px; font-weight:700; }
+      .score-orb { width: 166px; height:166px; border-radius:50%; display:flex; flex-direction:column; justify-content:center; align-items:center; margin: 8px auto 14px; background: conic-gradient(var(--score-color) calc(var(--score) * 1%), #e9edf5 0); position:relative; }
+      .score-orb:before { content:""; position:absolute; width:130px; height:130px; border-radius:50%; background:white; }
+      .score-orb strong, .score-orb span { z-index:1; } .score-orb strong { font-size:2.25rem; } .score-orb span { color:#667085; font-size:.78rem; }
+      .bar-label { display:flex; justify-content:space-between; margin:12px 0 6px; font-size:.88rem; font-weight:600; }
+      .bar-track { background:#edf0f6; height:9px; border-radius:10px; overflow:hidden; } .bar-fill { height:100%; border-radius:10px; background:linear-gradient(90deg,#4667d9,#5ccbbd); animation: grow .7s ease-out; transform-origin:left; } @keyframes grow { from { transform:scaleX(0); } to { transform:scaleX(1); } }
+      .tag { display:inline-block; background:#eef2ff; color:#3b59b8; padding:5px 9px; margin:2px; border-radius:99px; font-size:.82rem; font-weight:600; }
+      .missing { background:#fff4e5; color:#a35b00; }
+      .small-muted { color:#667085; font-size:.88rem; }
+      .stButton > button { border-radius:10px; font-weight:650; min-height:2.7rem; }
+      [data-testid="stFileUploader"] { background:#fff; padding:10px; border:1px dashed #9eace5; border-radius:14px; }
+      textarea, input[type="text"], [data-testid="stTextArea"] textarea, [data-testid="stTextInput"] input, [data-baseweb="textarea"] textarea {
+        color: #172033 !important; -webkit-text-fill-color: #172033 !important;
+        caret-color: #172033 !important; background: #ffffff !important;
+        border: 1px solid #cfd7e6 !important; border-radius: 12px !important;
+        font-size: .96rem !important; line-height: 1.5 !important;
+      }
+      textarea::placeholder, input[type="text"]::placeholder, [data-testid="stTextArea"] textarea::placeholder, [data-testid="stTextInput"] input::placeholder {
+        color: #7a8699 !important; -webkit-text-fill-color: #7a8699 !important; opacity: 1;
+      }
+      textarea:focus, input[type="text"]:focus, [data-testid="stTextArea"] textarea:focus, [data-testid="stTextInput"] input:focus {
+        border-color: #4667d9 !important; box-shadow: 0 0 0 3px rgba(70, 103, 217, .14) !important;
+      }
+      [data-testid="stTextArea"] label, [data-testid="stFileUploader"] label { color: #25324b !important; font-weight: 700 !important; }
+      [data-testid="stFileUploader"] button { color: #2449b8 !important; border-color: #aab8e8 !important; background: #f7f9ff !important; }
+      [data-testid="stDownloadButton"] button { background: #eef2ff !important; border: 1px solid #9eace5 !important; color: #193f9d !important; }
+      [data-testid="stDownloadButton"] button *, [data-testid="stDownloadButton"] button p { color: #193f9d !important; -webkit-text-fill-color: #193f9d !important; }
+      [data-testid="stText"], [data-testid="stCaptionContainer"] { color: #53617a !important; }
+      [data-testid="stText"] *, [data-testid="stCaptionContainer"] * { color: inherit !important; }
+      [data-baseweb="tab-list"] { gap: 8px; border-bottom: 1px solid #e7eaf2; }
+    [data-baseweb="tab-list"] [data-baseweb="tab"] { height: 42px; padding: 0 12px; color: #344054 !important; -webkit-text-fill-color: #344054 !important; font-weight: 700 !important; opacity: 1 !important; }
+    [data-baseweb="tab-list"] [data-baseweb="tab"] p, [data-baseweb="tab-list"] [data-baseweb="tab"] span { color: #344054 !important; -webkit-text-fill-color: #344054 !important; opacity: 1 !important; }
+    [data-baseweb="tab-list"] [data-baseweb="tab"][aria-selected="true"] { color: #c62828 !important; -webkit-text-fill-color: #c62828 !important; border-bottom: 3px solid #ef4444 !important; }
+    [data-baseweb="tab-list"] [data-baseweb="tab"][aria-selected="true"] p, [data-baseweb="tab-list"] [data-baseweb="tab"][aria-selected="true"] span { color: #c62828 !important; -webkit-text-fill-color: #c62828 !important; }
+    [data-baseweb="tab-highlight"] { background-color: #ef4444 !important; height: 3px !important; }
+      .page-intro { background: #ffffff; border: 1px solid #e7eaf2; border-radius: 18px; padding: 22px 24px; margin: 0 0 22px; }
+      .page-intro h1 { margin: 0 0 5px; color: #172a5a; font-size: 2rem; }
+      .page-intro p { margin: 0; color: #667085; }
+      .workflow-strip { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; margin:0 0 20px; }
+      .workflow-item { background:#fff; border:1px solid #dce3f0; border-radius:12px; padding:12px 14px; color:#53617a; font-size:.88rem; line-height:1.35; }
+      .workflow-item strong { display:block; color:#172a5a; font-size:.92rem; margin-bottom:3px; }
+      .workflow-item.active { border-color:#6e87df; background:#f3f6ff; box-shadow:0 3px 12px rgba(54,89,184,.09); }
+      .workflow-number { color:#3659b8; font-weight:800; margin-right:6px; }
+      .history-card { background: #ffffff; border: 1px solid #e7eaf2; border-radius: 16px; padding: 18px 20px; margin-bottom: 12px; }
+      .history-card strong { color: #172a5a; }
+      .history-meta { color: #667085; font-size: .88rem; margin-top: 4px; }
+            .toolkit-heading { display:flex; align-items:center; gap:10px; margin: 26px 0 4px; color:#172a5a; font-size:1.35rem; font-weight:800; }
+            .toolkit-heading::before { content:""; display:block; width:5px; height:25px; border-radius:4px; background:#2ba891; }
+            .toolkit-subtitle { color:#3f4d66; font-size:.94rem; margin:0 0 14px; line-height:1.5; }
+            .tool-index { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; margin:0 0 18px; }
+            .tool-index-card { background:#ffffff; border:1px solid #cbd5e5; border-left:4px solid #4667d9; border-radius:10px; padding:13px 14px; min-height:78px; box-sizing:border-box; box-shadow:0 3px 10px rgba(25,38,73,.045); }
+            .tool-index-card:nth-child(3n+2) { border-left-color:#2ba891; }
+            .tool-index-card:nth-child(3n) { border-left-color:#e7a329; }
+            .tool-index-card strong { display:block; color:#172a5a; font-size:.92rem; margin-bottom:4px; }
+            .tool-index-card span { display:block; color:#53617a; font-size:.8rem; line-height:1.35; }
+            @media (max-width: 800px) { .tool-index { grid-template-columns:1fr; } }
+            div[data-testid="stExpander"] { background:#ffffff !important; border:1px solid #cbd5e5 !important; border-radius:12px !important; margin:10px 0 !important; box-shadow:0 3px 12px rgba(25,38,73,.06); }
+            div[data-testid="stExpander"] details summary { background:#f1f5ff !important; color:#172a5a !important; border-radius:11px !important; min-height:3rem; }
+            div[data-testid="stExpander"] details summary svg { opacity:1 !important; color:#2449b8 !important; fill:#2449b8 !important; }
+            div[data-testid="stExpander"] details summary:hover { background:#e5ecff !important; }
+            div[data-testid="stExpander"] details summary p, div[data-testid="stExpander"] details summary span { color:#172a5a !important; -webkit-text-fill-color:#172a5a !important; font-weight:750 !important; }
+            div[data-testid="stExpander"] details[open] summary { border-bottom:1px solid #d8e0ef; border-radius:11px 11px 0 0 !important; }
+            div[data-testid="stExpander"] details > div { padding-top:12px; }
+            .tool-status { display:inline-block; color:#176b5c; background:#e0f6f0; border:1px solid #a8dfd2; border-radius:999px; padding:3px 9px; font-size:.78rem; font-weight:750; }
+            .tool-status.review { color:#8a5000; background:#fff1d6; border-color:#f2cf8e; }
+            .visibility-note { background:#edf7f5; border:1px solid #b8e4da; border-radius:10px; color:#175d52; padding:10px 12px; margin:0 0 14px; font-size:.88rem; }
+            @media (max-width: 800px) { .workflow-strip { grid-template-columns:1fr; } }
+            /* Keep essential labels readable even when an external Streamlit theme overrides inherited text colour. */
+            div[data-testid="stMetric"] { background:#ffffff !important; color:#172033 !important; }
+            div[data-testid="stMetric"] [data-testid="stMetricLabel"],
+            div[data-testid="stMetric"] [data-testid="stMetricValue"],
+            div[data-testid="stMetric"] [data-testid="stMetricDelta"],
+            div[data-testid="stMetric"] [data-testid="stMetricLabel"] *,
+            div[data-testid="stMetric"] [data-testid="stMetricValue"] *,
+            div[data-testid="stMetric"] [data-testid="stMetricDelta"] * { color:#172033 !important; -webkit-text-fill-color:#172033 !important; opacity:1 !important; text-shadow:none !important; }
+            [data-testid="stTabs"] [role="tab"],
+            [data-testid="stTabs"] button[data-baseweb="tab"],
+            [data-baseweb="tab-list"] [data-baseweb="tab"] { background:#ffffff !important; color:#172033 !important; -webkit-text-fill-color:#172033 !important; opacity:1 !important; border:1px solid #d5ddeb !important; border-bottom:3px solid #d5ddeb !important; border-radius:9px 9px 0 0 !important; }
+            [data-testid="stTabs"] [role="tab"] *,
+            [data-testid="stTabs"] button[data-baseweb="tab"] *,
+            [data-baseweb="tab-list"] [data-baseweb="tab"] * { color:#172033 !important; -webkit-text-fill-color:#172033 !important; opacity:1 !important; }
+            [data-testid="stTabs"] [role="tab"][aria-selected="true"],
+            [data-testid="stTabs"] button[data-baseweb="tab"][aria-selected="true"],
+            [data-baseweb="tab-list"] [data-baseweb="tab"][aria-selected="true"] { background:#eef2ff !important; border-color:#4667d9 !important; border-bottom-color:#4667d9 !important; }
+            [data-testid="stTabs"] [role="tab"][aria-selected="true"] *,
+            [data-testid="stTabs"] button[data-baseweb="tab"][aria-selected="true"] *,
+            [data-baseweb="tab-list"] [data-baseweb="tab"][aria-selected="true"] * { color:#193f9d !important; -webkit-text-fill-color:#193f9d !important; }
+            /* Product-level visual system */
+            .stApp { background:linear-gradient(180deg, #f8faff 0%, #f5f7fc 55%, #f8fafc 100%) !important; }
+            .block-container { max-width:1240px !important; padding-top:2.35rem !important; }
+            [data-testid="stSidebar"] { background:linear-gradient(180deg, #0d1833 0%, #142852 100%) !important; border-right:1px solid rgba(255,255,255,.08); }
+            .brand-mark { display:flex; gap:11px; align-items:center; padding:7px 2px 20px; }
+            .brand-icon { width:36px; height:36px; border-radius:11px; display:grid; place-items:center; background:linear-gradient(135deg,#63d5c2,#5274e8); color:#07152f !important; font-weight:900; font-size:1.1rem; box-shadow:0 8px 18px rgba(70,103,217,.25); }
+            .brand-name { color:#ffffff; font-size:1.08rem; font-weight:800; letter-spacing:-.02em; line-height:1.1; }
+            .brand-subtitle { color:#aebddd !important; font-size:.72rem; margin-top:3px; }
+            [data-testid="stSidebar"] [data-testid="stRadio"] { padding:8px 0; }
+            [data-testid="stSidebar"] .stRadio label { min-height:40px; display:flex; align-items:center; transition:background .18s ease, transform .18s ease; }
+            [data-testid="stSidebar"] .stRadio label:hover { background:rgba(100,130,220,.24); transform:translateX(2px); }
+            h1, h2, h3 { color:#14213d; }
+            .page-intro, .analysis-hero { position:relative; overflow:hidden; background:linear-gradient(115deg,#172a5a 0%,#284b9e 62%,#3d72c7 100%); border:0; box-shadow:0 18px 42px rgba(23,42,90,.18); padding:30px 34px; }
+            .page-intro::after, .analysis-hero::after { content:""; position:absolute; width:240px; height:240px; border-radius:50%; background:rgba(120,235,216,.15); right:-68px; top:-110px; }
+            .page-intro h1, .analysis-hero h1 { position:relative; z-index:1; color:#fff; font-size:2.2rem; }
+            .page-intro p, .analysis-hero p { position:relative; z-index:1; color:#dbe6ff; font-size:1rem; max-width:720px; }
+            .page-kicker { position:relative; z-index:1; margin:0 0 8px; color:#85e6d5; font-size:.74rem; font-weight:800; letter-spacing:.12em; text-transform:uppercase; }
+            .workflow-strip { gap:12px; margin:22px 0 24px; }
+            .workflow-item { border:1px solid #e0e7f3; border-radius:14px; padding:14px 16px; box-shadow:0 5px 16px rgba(19,40,86,.04); }
+            .workflow-item.active { border-color:#93a9ec; background:linear-gradient(135deg,#f5f7ff,#eef5ff); box-shadow:0 8px 20px rgba(54,89,184,.10); }
+            [data-testid="stFileUploader"], [data-testid="stTextArea"] { border-radius:16px; }
+            [data-testid="stFileUploader"] { padding:16px; border:1.5px dashed #7d96df; box-shadow:0 4px 15px rgba(24,49,111,.04); }
+            [data-testid="stFileUploader"] section { padding:12px 6px; }
+            [data-testid="stTextArea"] textarea { min-height:164px; box-shadow:0 3px 10px rgba(19,40,86,.025); }
+            .stButton > button, [data-testid="stDownloadButton"] button { transition:transform .16s ease, box-shadow .16s ease; }
+            .stButton > button[kind="primary"] { border:0 !important; background:linear-gradient(135deg,#2449b8,#3e6ed4) !important; box-shadow:0 9px 18px rgba(36,73,184,.22); color:#fff !important; }
+            .stButton > button[kind="primary"] * { color:#fff !important; }
+            .stButton > button:hover, [data-testid="stDownloadButton"] button:hover { transform:translateY(-1px); box-shadow:0 8px 17px rgba(27,54,122,.16); }
+            .stButton > button:focus-visible, [data-testid="stDownloadButton"] button:focus-visible, [role="tab"]:focus-visible { outline:3px solid rgba(70,103,217,.38) !important; outline-offset:2px; }
+            .report-header { display:flex; align-items:center; justify-content:space-between; gap:16px; margin:30px 0 4px; }
+            .report-header h2 { margin:0; font-size:1.55rem; }
+            .report-badge { display:inline-flex; align-items:center; gap:7px; border:1px solid #bce4da; background:#eaf8f4; color:#176b5c; border-radius:999px; padding:6px 10px; font-size:.78rem; font-weight:750; white-space:nowrap; }
+            div[data-testid="stMetric"] { border:1px solid #e0e7f3 !important; box-shadow:0 7px 20px rgba(19,40,86,.055); }
+            .score-orb { box-shadow:0 10px 25px rgba(20,47,103,.07); }
+            .history-card { border:1px solid #e0e7f3; box-shadow:0 5px 15px rgba(19,40,86,.045); transition:transform .16s ease, box-shadow .16s ease; }
+            .history-card:hover { transform:translateY(-2px); box-shadow:0 11px 24px rgba(19,40,86,.09); }
+            .feature-card, .insight-card { border-color:#e0e7f3; box-shadow:0 7px 18px rgba(19,40,86,.04); }
+            .feature-card { transition:transform .16s ease, box-shadow .16s ease; }
+            .feature-card:hover { transform:translateY(-3px); box-shadow:0 13px 26px rgba(19,40,86,.09); }
+            .section-lead { margin:18px 0 18px; padding:18px 20px; border:1px solid #dbe4f3; border-radius:15px; background:linear-gradient(110deg,#f8faff,#f1f6ff); }
+            .section-eyebrow { color:#4064c5; font-size:.72rem; letter-spacing:.11em; font-weight:800; text-transform:uppercase; margin-bottom:5px; }
+            .section-lead h3 { color:#172a5a; margin:0 0 5px; font-size:1.15rem; }
+            .section-lead p { color:#53617a; margin:0; font-size:.92rem; line-height:1.5; }
+            .alignment-panel { background:#fff; border:1px solid #e0e7f3; border-radius:15px; padding:17px 18px; min-height:145px; box-shadow:0 5px 14px rgba(19,40,86,.035); }
+            .alignment-panel.covered { border-top:4px solid #2ba891; }
+            .alignment-panel.gaps { border-top:4px solid #e7a329; }
+            .alignment-panel h4 { color:#172a5a; margin:0 0 5px; font-size:1rem; }
+            .alignment-panel p { color:#667085; margin:0 0 10px; font-size:.84rem; }
+            .signal-card { background:#fff; border:1px solid #e0e7f3; border-radius:15px; padding:17px; box-shadow:0 5px 14px rgba(19,40,86,.035); }
+            .strategy-card { border:1px solid #c9d7f7; background:linear-gradient(135deg,#eef4ff,#f7f9ff); border-radius:15px; padding:20px; }
+            .strategy-card p { color:#2b3c60; line-height:1.62; margin:0; }
+            .danger-zone { background:#fff7f7; border:1px solid #f1c4c9; border-left:4px solid #d95d6a; border-radius:13px; padding:14px 16px; }
+            .danger-zone strong { color:#922f3d; display:block; margin-bottom:3px; }
+            .danger-zone span { color:#7e5960; font-size:.86rem; line-height:1.4; }
+            .st-key-clear_history_button button { background:#c73645 !important; border:1px solid #a92332 !important; color:#ffffff !important; box-shadow:0 7px 14px rgba(174,35,50,.18) !important; }
+            .st-key-clear_history_button button * { color:#ffffff !important; -webkit-text-fill-color:#ffffff !important; }
+            .st-key-clear_history_button button:hover:not(:disabled) { background:#a92332 !important; box-shadow:0 9px 18px rgba(174,35,50,.26) !important; }
+            .st-key-clear_history_button button:disabled { background:#e8b8be !important; border-color:#e0a2aa !important; color:#7b3d45 !important; box-shadow:none !important; opacity:1 !important; }
+            .st-key-clear_history_button button:disabled * { color:#7b3d45 !important; -webkit-text-fill-color:#7b3d45 !important; }
+            /* Report navigation: quiet underline tabs, not button-like boxes. */
+            div[data-testid="stTabs"] { margin-top:34px !important; }
+            div[data-testid="stTabs"] [data-baseweb="tab-list"] { gap:24px !important; padding:0 3px !important; border-bottom:1px solid #dce3ef !important; }
+            div[data-testid="stTabs"] [role="tab"],
+            div[data-testid="stTabs"] button[data-baseweb="tab"],
+            div[data-testid="stTabs"] [data-baseweb="tab-list"] [data-baseweb="tab"] { height:44px !important; padding:0 0 10px !important; background:transparent !important; border:0 !important; border-bottom:2px solid transparent !important; border-radius:0 !important; color:#65718a !important; font-size:.91rem !important; font-weight:650 !important; box-shadow:none !important; }
+            div[data-testid="stTabs"] [role="tab"] *,
+            div[data-testid="stTabs"] button[data-baseweb="tab"] *,
+            div[data-testid="stTabs"] [data-baseweb="tab-list"] [data-baseweb="tab"] * { color:#65718a !important; -webkit-text-fill-color:#65718a !important; }
+            div[data-testid="stTabs"] [role="tab"][aria-selected="true"],
+            div[data-testid="stTabs"] button[data-baseweb="tab"][aria-selected="true"],
+            div[data-testid="stTabs"] [data-baseweb="tab-list"] [data-baseweb="tab"][aria-selected="true"] { background:transparent !important; border:0 !important; border-bottom:2px solid #3659b8 !important; }
+            div[data-testid="stTabs"] [role="tab"][aria-selected="true"] *,
+            div[data-testid="stTabs"] button[data-baseweb="tab"][aria-selected="true"] *,
+            div[data-testid="stTabs"] [data-baseweb="tab-list"] [data-baseweb="tab"][aria-selected="true"] * { color:#193f9d !important; -webkit-text-fill-color:#193f9d !important; font-weight:750 !important; }
+            @media (max-width: 720px) { .page-intro, .analysis-hero { padding:24px 21px; } .page-intro h1, .analysis-hero h1 { font-size:1.75rem; } .report-header { align-items:flex-start; flex-direction:column; } }
+    </style>
+    """, unsafe_allow_html=True)
 
-    .resume-preview-container h2 {
-        font-size: 14px;
-        margin-top: 15px;
-        margin-bottom: 8px;
-        color: #2C3E50;
-        border-bottom: 2px solid #2C3E50;
-        padding-bottom: 3px;
-        font-weight: bold;
-    }
 
-    .resume-preview-container h3 {
-        font-size: 12px;
-        margin-top: 8px;
-        margin-bottom: 3px;
-        color: #34495E;
-        font-weight: bold;
-    }
+inject_styles()
 
-    .resume-preview-container p {
-        margin: 3px 0;
-        font-size: 12px;
-    }
 
-    .resume-preview-container ul {
-        margin: 5px 0;
-        padding-left: 20px;
-        font-size: 12px;
-    }
-
-    .resume-preview-container li {
-        margin: 2px 0;
-    }
-
-    .resume-content-text {
-        white-space: pre-wrap;
-        word-wrap: break-word;
-        font-size: 12px;
-        line-height: 1.6;
-        font-family: 'Calibri', 'Arial', sans-serif;
-    }
-
-    .resume-preview-pdf {
-        border: 1px solid #ddd;
-        border-radius: 8px;
-        overflow: hidden;
-    }
-
-    .preview-label {
-        font-weight: bold;
-        color: #2C3E50;
-        margin-top: 15px;
-        font-size: 14px;
-    }
-    """
-    st.markdown(f"<style>{css_code}</style>", unsafe_allow_html=True)
-
-load_css()
-
-# ==================================================
-# Paths
-# ==================================================
-temp_dir = Path("temp_uploads")
-temp_dir.mkdir(exist_ok=True)
-history_file = temp_dir / "history.json"
-if not history_file.exists():
-    history_file.write_text(json.dumps([]))
-
-# ==================================================
-# History Management Functions (FIXED: Robust Loading)
-# ==================================================
 def load_history():
-    """Loads analysis history from the JSON file, handling corruption."""
     try:
-        with open(history_file, 'r') as f:
-            data = json.load(f)
-            # Ensure the root object is a list
-            if isinstance(data, list):
-                return data
-            return []
-    except (json.JSONDecodeError, FileNotFoundError, IOError):
-        # If file doesn't exist or is invalid JSON, return empty list
-        return []
-    except Exception:
+        data = json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except (OSError, json.JSONDecodeError):
         return []
 
-def save_history(new_entry):
-    """Adds a new entry to the history file."""
+
+def save_history(entry):
     history = load_history()
-    # Limit history size to prevent file bloat
-    if len(history) >= 20: 
-        history = history[-19:]
-    
-    history.append(new_entry)
-    
-    try:
-        with open(history_file, 'w') as f:
-            json.dump(history, f, indent=4)
-    except Exception as e:
-        print(f"Error saving history: {e}")
+    history.append(entry)
+    HISTORY_PATH.write_text(json.dumps(history[-30:], indent=2), encoding="utf-8")
 
-# ==================================================
-# Sidebar Navigation (Improved)
-# ==================================================
-st.sidebar.markdown("## 📌 Navigation")
 
-page_selection = st.sidebar.radio(
-    "",
-    ["🏠 Home", "🤖 AI Analyzer", "📜 History"]
-)
+@st.cache_data(show_spinner=False)
+def extract_text(file_bytes, filename):
+    extension = filename.rsplit(".", 1)[-1].lower()
+    buffer = io.BytesIO(file_bytes)
+    if extension == "pdf":
+        return "\n".join(page.extract_text() or "" for page in PyPDF2.PdfReader(buffer).pages)
+    if extension == "docx":
+        return "\n".join(paragraph.text for paragraph in Document(buffer).paragraphs)
+    return ""
 
-# Normalize page value (strip icons for logic)
-if "Home" in page_selection:
-    page = "Home"
-elif "AI Analyzer" in page_selection:
-    page = "AI Analyzer"
-elif "History" in page_selection:
-    page = "History"
-else:
-    page = "Home" # Default
 
-# ==================================================
-# Animated Score Chart
-# ==================================================
-def animated_score_chart(score: int, size=(2.8, 2.8), font_size=18, thickness=0.4):
-    placeholder = st.empty()
-
-    def score_color(val):
-        if val < 50:
-            return "#E74C3C"  # red
-        elif val < 75:
-            return "#F39C12"  # orange
+def render_resume_preview(file_bytes, filename, resume_text):
+    """Keep the original live document preview, presented as a collapsible review step."""
+    extension = filename.rsplit(".", 1)[-1].lower()
+    with st.expander("Live resume preview", expanded=False):
+        if extension == "pdf":
+            encoded = base64.b64encode(file_bytes).decode("utf-8")
+            st.markdown(f"<iframe title='Resume preview' src='data:application/pdf;base64,{encoded}' width='100%' height='720' style='border:1px solid #e7eaf2;border-radius:12px;'></iframe>", unsafe_allow_html=True)
         else:
-            return "#2ECC71"  # green
-
-    # Build sliding animation by drawing the pie to an image and moving it in via CSS transform
-    steps = [i for i in range(0, score, max(1, score // 20))]
-    steps.append(score)
-
-    # Starting offset percentage (slide from left)
-    start_offset = -40  # pixels
-    for idx, i in enumerate(steps):
-        fig, ax = plt.subplots(figsize=size)
-        color = score_color(i)
-        ax.pie(
-            [i, 100 - i],
-            colors=[color, "#ECECEC"],
-            startangle=90,
-            wedgeprops={"width": thickness, "edgecolor": "white"},
-            counterclock=False
-        )
-        ax.text(
-            0, 0, f"{i}%", ha="center", va="center",
-            fontsize=font_size, fontweight="bold", color="#2C3E50"
-        )
-        ax.axis("equal")
-
-        buf = io.BytesIO()
-        fig.savefig(buf, format='png', bbox_inches='tight', transparent=True)
-        plt.close(fig)
-        buf.seek(0)
-        img_b64 = base64.b64encode(buf.read()).decode('utf-8')
-
-        # compute current offset easing from start_offset to 0
-        progress = (idx + 1) / len(steps)
-        offset_px = int(start_offset * (1 - progress))
-
-        html = f"""
-        <div class='chart-container' style='width:{int(size[0]*100)}px;'>
-            <img src='data:image/png;base64,{img_b64}' style='transform: translateX({offset_px}px); transition: transform 0.18s ease-out; max-width:100%; height:auto;' />
-        </div>
-        """
-        placeholder.markdown(html, unsafe_allow_html=True)
-        time.sleep(0.02)
-
-    # Final frame larger display
-    fig, ax = plt.subplots(figsize=(4, 4))
-    color = score_color(score)
-    ax.pie(
-        [score, 100 - score],
-        colors=[color, "#ECECEC"],
-        startangle=90,
-        wedgeprops={"width": 0.35, "edgecolor": "white"},
-        counterclock=False
-    )
-    ax.text(
-        0, 0, f"{score}%", ha="center", va="center",
-        fontsize=26, fontweight="bold", color="#2C3E50"
-    )
-    ax.axis("equal")
-
-    buf = io.BytesIO()
-    fig.savefig(buf, format='png', bbox_inches='tight', transparent=True)
-    plt.close(fig)
-    buf.seek(0)
-    img_b64 = base64.b64encode(buf.read()).decode('utf-8')
-    final_html = f"""
-    <div class='chart-container' style='width:400px;'>
-        <img src='data:image/png;base64,{img_b64}' style='transform: translateX(0px); transition: transform 0.35s ease-out; max-width:100%; height:auto;' />
-    </div>
-    """
-    placeholder.markdown(final_html, unsafe_allow_html=True)
+            st.markdown("<div class='insight-card'><h3>DOCX text preview</h3><p style='white-space:pre-wrap;max-height:650px;overflow:auto'>"
+                        + html.escape(resume_text[:12000]) + "</p></div>", unsafe_allow_html=True)
 
 
-# ==================================================
-# Custom Animated Progress Bar Function
-# ==================================================
-def animated_progress_bar(label, value):
-    """Displays an animated progress bar using custom HTML/CSS."""
-    # Determine color class based on value
-    if value < 50:
-        color_class = "danger"
-    elif value < 75:
-        color_class = "warning"
-    else:
-        color_class = "" # Default green
-        
-    html = f"""
-    <div style="font-weight: bold; margin-top: 15px;">{label} ({value}%)</div>
-    <div class="progress-bar-container">
-        <div class="progress-bar-fill {color_class}" style="width: {value}%;"></div>
-    </div>
-    """
-    # The animation relies on the CSS transition property
-    st.markdown(html, unsafe_allow_html=True)
+def jd_terms(job_description):
+    words = re.findall(r"\b[a-z][a-z+#.]{2,}\b", job_description.lower())
+    common = [word for word, _ in Counter(words).most_common(20) if word not in STOP_WORDS]
+    known = [skill for skill in SKILLS if re.search(rf"(?<!\w){re.escape(skill)}(?!\w)", job_description.lower())]
+    return list(dict.fromkeys(known + common))[:15]
 
-# ==================================================
-# Text Extraction and Document Display
-# ==================================================
-@st.cache_data
-def extract_text(uploaded_file): 
-    """Extracts text from a PDF or DOCX file."""
-    
-    ext = uploaded_file.name.split(".")[-1].lower() 
-    content = ""
-    
-    uploaded_file.seek(0) 
-    file_bytes = uploaded_file.read() 
-    
-    try:
-        file_buffer = io.BytesIO(file_bytes)
-        
-        if ext == "pdf":
-            pdf = PyPDF2.PdfReader(file_buffer)
-            content = "\n".join([p.extract_text() or "" for p in pdf.pages])
-        elif ext == "docx":
-            doc = Document(file_buffer) 
-            content = "\n".join([p.text for p in doc.paragraphs])
+
+def term_variants(term):
+    """Return close, role-relevant wording variants without treating unrelated words as matches."""
+    normalized = term.lower().strip()
+    variants = {normalized}
+    role_aliases = {
+        "tester": {"test", "testing", "qa", "quality assurance", "quality analyst", "test engineer", "software tester"},
+        "testing": {"test", "tester", "qa", "quality assurance", "quality analyst", "test engineer", "software tester"},
+        "qa": {"quality assurance", "quality analyst", "tester", "testing", "test engineer"},
+        "quality assurance": {"qa", "quality analyst", "tester", "testing", "test engineer"},
+    }
+    variants.update(role_aliases.get(normalized, set()))
+    if normalized.endswith("er") and len(normalized) > 4:
+        root = normalized[:-2]
+        variants.update({root, root + "ing"})
+    elif normalized.endswith("ing") and len(normalized) > 5:
+        root = normalized[:-3]
+        variants.update({root, root + "er"})
+    return variants
+
+
+def has_term(text, term):
+    lowered = text.lower()
+    return any(bool(re.search(rf"(?<!\w){re.escape(variant)}(?!\w)", lowered)) for variant in term_variants(term))
+
+
+def analyze(text, job_description=""):
+    lowered = text.lower()
+    contact = {
+        "Email": bool(re.search(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b", text)),
+        "Phone": bool(re.search(r"(?:\+?\d[\d .()-]{7,}\d)", text)),
+        "LinkedIn": "linkedin.com/in" in lowered,
+        "Portfolio": "github.com" in lowered or "portfolio" in lowered,
+    }
+    headings = {
+        "Experience": ["experience", "employment", "work history", "internship"],
+        "Education": ["education", "bachelor", "master", "university", "college"],
+        "Skills": ["skills", "technical skills", "competencies"],
+        "Projects": ["projects", "project experience", "selected projects"],
+    }
+    sections = {name: 100 if any(term in lowered for term in terms) else 25 for name, terms in headings.items()}
+    found_skills = [skill for skill in SKILLS if has_term(lowered, skill)]
+    sections["Skills"] = min(100, max(sections["Skills"], round(len(found_skills) / 7 * 100)))
+    action_count = sum(len(re.findall(rf"(?<!\w){verb}(?:ed|ing|s)?(?!\w)", lowered)) for verb in ACTION_VERBS)
+    metrics_count = len(re.findall(r"(?:\$|₹|€|£)?\s*\d+(?:\.\d+)?\s*(?:%|x|k\b|m\b|million|thousand|users|customers|hours|days)", lowered))
+    readability = max(0, min(100, round(flesch_reading_ease(text))))
+    structure = round(sum(sections.values()) / len(sections))
+    impact = min(100, 45 + action_count * 7 + metrics_count * 8)
+    contact_score = round(sum(contact.values()) / len(contact) * 100)
+    core_score = round(structure * .48 + impact * .32 + contact_score * .20)
+    terms = jd_terms(job_description) if job_description.strip() else []
+    matched_terms = [term for term in terms if has_term(lowered, term)]
+    missing_terms = [term for term in terms if term not in matched_terms]
+    match_score = round(len(matched_terms) / len(terms) * 100) if terms else 0
+    score = min(100, round(core_score * .72 + match_score * .28) if terms else core_score)
+    suggestions = []
+    if not contact["Email"] or not contact["Phone"]:
+        suggestions.append(("Contact details", "Add a professional email address and phone number in the header."))
+    if not contact["LinkedIn"]:
+        suggestions.append(("Professional presence", "Add a LinkedIn URL so recruiters can verify your professional profile."))
+    if metrics_count < 3:
+        suggestions.append(("Show impact", "Add 2–3 measurable outcomes, such as time saved, revenue influenced, scale, or percentage change."))
+    if action_count < 5:
+        suggestions.append(("Strengthen bullets", "Lead achievement bullets with specific action verbs: built, led, improved, delivered, or optimized."))
+    if missing_terms:
+        suggestions.append(("Tailor to this role", f"Where truthful, reflect these priority terms in your summary and experience: {', '.join(missing_terms[:5])}."))
+    if sections["Projects"] < 100:
+        suggestions.append(("Evidence of work", "Add a Projects section with scope, tools used, and one measurable result."))
+    exp_years = sum(int(year) for year in re.findall(r"(\d+)\s+years?", lowered))
+    projects_count = len(re.findall(r"\bprojects?\b", lowered))
+    return {"score": score, "core_score": core_score, "match_score": match_score, "sections": sections, "contact": contact, "skills": found_skills, "action_count": action_count, "metrics_count": metrics_count, "readability": readability, "terms": terms, "matched_terms": matched_terms, "missing_terms": missing_terms, "suggestions": suggestions[:5], "exp_years": exp_years, "projects_count": projects_count}
+
+
+def resume_bullets(text):
+    """Extract likely achievement lines for rewrite prompts without claiming they are facts."""
+    candidates = []
+    for line in text.splitlines():
+        clean = re.sub(r"^[\s•*\-–—]+", "", line).strip()
+        if len(clean) >= 35 and (clean.startswith(tuple(verb.title() for verb in ACTION_VERBS)) or re.match(r"^(built|led|created|managed|developed|implemented|improved|analyzed)\b", clean, re.I)):
+            candidates.append(clean)
+    if not candidates:
+        candidates = [item.strip() for item in re.split(r"(?<=[.!?])\s+", text) if len(item.strip()) >= 45]
+    return candidates[:4]
+
+
+def gap_coach(text, result):
+    source_lines = resume_bullets(text)
+    rewrites = []
+    for index, term in enumerate(result["missing_terms"][:5]):
+        current = source_lines[index % len(source_lines)] if source_lines else "Choose a relevant project or experience bullet."
+        verb = ["Delivered", "Improved", "Built", "Partnered", "Optimized"][index % 5]
+        rewrite = f"{verb} [project or process] using {term.title()} to [specific outcome], improving [metric] by [amount]."
+        rewrites.append((term, current, rewrite))
+    return rewrites
+
+
+def ats_scan(text, job_description, result):
+    words = re.findall(r"\b\w+\b", text)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    keyword_hits = sum(len(re.findall(rf"(?<!\w){re.escape(term)}(?!\w)", text.lower())) for term in result["terms"])
+    density = round(keyword_hits / max(len(words), 1) * 100, 2)
+    issues = []
+    if len(words) < 180:
+        issues.append(("Content length", "Your extracted resume is short. Add concise evidence for experience, projects, and outcomes."))
+    if not result["contact"]["Email"] or not result["contact"]["Phone"]:
+        issues.append(("Header details", "Add a readable email address and phone number near the top of the resume."))
+    missing_sections = [name for name, value in result["sections"].items() if value < 100]
+    if missing_sections:
+        issues.append(("Section labels", "Use clear ATS-friendly headings: " + ", ".join(missing_sections) + "."))
+    if sum(1 for line in lines if len(line) > 180) > 3:
+        issues.append(("Dense text", "Split long paragraphs into short achievement bullets so both parsers and recruiters can scan them."))
+    if job_description and density > 4:
+        issues.append(("Keyword balance", "Role-term density is high. Keep only terms supported by a concrete accomplishment to avoid keyword stuffing."))
+    if not issues:
+        issues.append(("Parser check", "No obvious text-extraction risks were detected. Verify the final PDF still has selectable text before applying."))
+    order = [name for name in ("Experience", "Education", "Skills", "Projects") if result["sections"][name] >= 100]
+    return {"issues": issues, "density": density, "keyword_hits": keyword_hits, "word_count": len(words), "section_order": order}
+
+
+def interview_questions(result):
+    questions = ["Walk me through the achievement on your resume that best demonstrates impact for this role."]
+    for term in result["matched_terms"][:3]:
+        questions.append(f"Tell me about a time you used {term.title()}. What was the problem, what did you do, and what changed?")
+    for term in result["missing_terms"][:2]:
+        questions.append(f"This role emphasizes {term.title()}. Which transferable experience would you use to show you can succeed with it?")
+    questions.append("Which result from your resume would you quantify differently after reviewing this job description?")
+    return questions[:6]
+
+
+def tailored_summary(result):
+    strengths = ", ".join(skill.title() for skill in result["skills"][:4]) or "relevant technical and business skills"
+    target = ", ".join(term.title() for term in result["matched_terms"][:3]) or "the target role's core requirements"
+    gap = result["missing_terms"][0].title() if result["missing_terms"] else None
+    summary = f"Results-focused professional with experience in {strengths}, bringing evidence of delivery through projects and measurable outcomes."
+    summary += f" Tailored for roles that value {target}, with a clear focus on translating relevant experience into business impact."
+    if gap:
+        summary += f" Where accurate, add one concrete example that demonstrates {gap}."
+    return summary
+
+
+def skill_roadmap(job_description, result):
+    requested_skills = [skill for skill in SKILLS if has_term(job_description, skill)]
+    missing_skills = [skill for skill in requested_skills if skill not in result["skills"]]
+    priorities = []
+    for index, skill in enumerate(missing_skills[:5]):
+        priority = "High priority" if index < 2 else "Build next"
+        evidence = f"Complete a small {skill.title()} project and add the tool, scope, and result to your resume."
+        priorities.append((skill, priority, evidence))
+    if not priorities and requested_skills:
+        priorities.append(("Evidence depth", "Strengthen", "Your requested technical skills are covered. Add a project or quantified outcome for the two most relevant ones."))
+    if not priorities and job_description.strip():
+        testing_role = any(has_term(job_description, term) for term in ("tester", "testing", "qa", "quality assurance"))
+        if testing_role:
+            priorities.append(("QA and testing evidence", "Strengthen", "Add one concise bullet showing your test approach, such as test cases, regression coverage, defect reporting, automation, or a quality outcome."))
+            priorities.append(("Role-ready proof", "Build next", "Prepare a small testing portfolio example: the scenario, checks performed, tools used, defect found or prevented, and the measurable result."))
         else:
-            st.error("Unsupported file type.")
-            return ""
-            
-    except Exception as e:
-        st.error(f"Failed to parse file. It might be corrupt or password-protected: {e}")
-        return ""
-        
-    return content.lower()
+            focus_terms = jd_terms(job_description)[:3]
+            focus = ", ".join(term.title() for term in focus_terms) or "the target role"
+            priorities.append(("Role evidence", "Strengthen", f"The target role emphasizes {focus}. Add a truthful experience or project bullet that demonstrates the most relevant responsibility and its outcome."))
+    return priorities
 
 
-# ==================================================
-# Text-to-Speech Function
-# ==================================================
-def _speak_with_modulation(text, rate: int = 150, volume: float = 1.0, voice_id: str = None):
-    """Generate TTS audio bytes with modulation. Uses pyttsx3 when available, otherwise gTTS fallback.
+def evidence_trace(text, job_description, result):
+    """Return explainable source lines for the signals used by the local scorer."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    traces = []
 
-    Returns bytes (WAV or MP3) or None on failure.
-    """
-    if not text:
-        return None
+    def add_trace(signal, status, matches, explanation):
+        if matches:
+            traces.append((signal, status, matches[:3], explanation))
+        else:
+            traces.append((signal, status, [], explanation))
 
-    # Try pyttsx3 first (allows rate/volume/voice alterations and WAV output on most platforms)
-    if _PYTTSX3_AVAILABLE:
+    contact_matches = [line for line in lines if re.search(r"@|linkedin\.com/in|github\.com|(?:\+?\d[\d .()\-]{7,}\d)", line, re.I)]
+    add_trace("Contact details", "Supported" if all(result["contact"].values()) else "Needs review", contact_matches, "Email, phone, LinkedIn, and portfolio signals contribute to contact completeness.")
+
+    section_matches = [line for line in lines if any(term in line.lower() for terms in ("experience", "education", "skills", "projects") for term in terms)]
+    add_trace("Resume sections", "Supported" if all(value == 100 for value in result["sections"].values()) else "Needs review", section_matches, "Recognized section headings contribute to structural completeness.")
+
+    action_matches = [line for line in lines if any(re.search(rf"(?<!\w){re.escape(verb)}(?:ed|ing|s)?(?!\w)", line.lower()) for verb in ACTION_VERBS)]
+    add_trace("Action-oriented language", "Supported" if result["action_count"] else "Needs review", action_matches, "Action verbs contribute to the impact signal.")
+
+    metric_matches = [line for line in lines if re.search(r"(?:\$|₹|€|£)?\s*\d+(?:\.\d+)?\s*(?:%|x|k\b|m\b|million|thousand|users|customers|hours|days)", line.lower())]
+    add_trace("Measurable outcomes", "Supported" if result["metrics_count"] else "Needs review", metric_matches, "Numbers, percentages, scale, and time measures contribute to evidence of impact.")
+
+    role_matches = [line for line in lines if any(has_term(line, term) for term in result["matched_terms"])]
+    add_trace("Role alignment", "Supported" if role_matches else ("Unavailable" if not job_description.strip() else "Needs review"), role_matches, "Terms shared with the target job description contribute to role alignment.")
+    return traces
+
+
+def claim_review(text):
+    """Flag claims that deserve human verification; this is not a truth detector."""
+    patterns = [
+        (r"\b(certified|certification|licensed|licence|license)\b", "Certification or licence claim"),
+        (r"\b(expert|mastery|proficient|specialist)\b", "Strength-of-skill claim"),
+        (r"\b\d+\+?\s+years?\b", "Experience-duration claim"),
+        (r"\b(?:increased|reduced|improved|saved|generated|grew)\b[^\n.]{0,100}\b\d+(?:\.\d+)?\s*%", "Quantified achievement"),
+    ]
+    findings = []
+    for line in [item.strip() for item in text.splitlines() if item.strip()]:
+        for pattern, label in patterns:
+            if re.search(pattern, line, re.I):
+                findings.append((label, line))
+                break
+    return findings[:12]
+
+
+def simulated_score(result, improvements):
+    """Estimate the score impact without mutating the original analysis result."""
+    sections = dict(result["sections"])
+    contact = dict(result["contact"])
+    action_count = result["action_count"]
+    metrics_count = result["metrics_count"]
+    matched_terms = len(result["matched_terms"])
+    if improvements.get("sections"):
+        sections.update({name: 100 for name, value in sections.items() if value < 100})
+    if improvements.get("contact"):
+        contact.update({name: True for name, value in contact.items() if not value})
+    if improvements.get("impact"):
+        action_count = max(action_count, 5)
+        metrics_count = max(metrics_count, 3)
+    if improvements.get("role"):
+        matched_terms = len(result["terms"])
+    structure = round(sum(sections.values()) / len(sections))
+    impact = min(100, 45 + action_count * 7 + metrics_count * 8)
+    contact_score = round(sum(contact.values()) / len(contact) * 100)
+    core_score = round(structure * .48 + impact * .32 + contact_score * .20)
+    match_score = round(matched_terms / len(result["terms"]) * 100) if result["terms"] else 0
+    score = min(100, round(core_score * .72 + match_score * .28) if result["terms"] else core_score)
+    return score, core_score, match_score
+
+
+def version_comparison(original_text, revised_text, job_description):
+    original = analyze(original_text, job_description)
+    revised = analyze(revised_text, job_description)
+    original_words = set(re.findall(r"\b[a-z][a-z+#.]{2,}\b", original_text.lower()))
+    revised_words = set(re.findall(r"\b[a-z][a-z+#.]{2,}\b", revised_text.lower()))
+    original_sections = {name for name, value in original["sections"].items() if value == 100}
+    revised_sections = {name for name, value in revised["sections"].items() if value == 100}
+    added_terms = sorted(revised["matched_terms"] if revised["terms"] else revised_words - original_words)
+    removed_terms = sorted(original["matched_terms"] if original["terms"] else original_words - revised_words)
+    changed_lines = list(difflib.unified_diff(original_text.splitlines(), revised_text.splitlines(), lineterm=""))
+    return {
+        "original": original,
+        "revised": revised,
+        "added_sections": sorted(revised_sections - original_sections),
+        "removed_sections": sorted(original_sections - revised_sections),
+        "added_terms": added_terms[:12],
+        "removed_terms": removed_terms[:12],
+        "changed_lines": changed_lines[:24],
+    }
+
+
+def score_color(score):
+    return "#2ba891" if score >= 75 else "#e7a329" if score >= 55 else "#d95d6a"
+
+
+def score_orb(score, label):
+    st.markdown(f"<div class='score-orb' style='--score:{score};--score-color:{score_color(score)}'><strong>{score}</strong><span>{label}</span></div>", unsafe_allow_html=True)
+
+
+def progress(label, value):
+    st.markdown(f"<div class='bar-label'><span>{html.escape(label)}</span><span>{value}%</span></div><div class='bar-track'><div class='bar-fill' style='width:{value}%'></div></div>", unsafe_allow_html=True)
+
+
+def tag_markup(items, missing=False):
+    if not items:
+        return "<span class='small-muted'>Nothing to show yet.</span>"
+    kind = " missing" if missing else ""
+    return "".join(f"<span class='tag{kind}'>{html.escape(item.title())}</span>" for item in items)
+
+
+def tags(items, missing=False):
+    st.markdown(tag_markup(items, missing), unsafe_allow_html=True)
+
+
+def report_markdown(result, file_name, resume_text="", job_description=""):
+    lines = [f"# Resume Insight Report — {file_name}", f"Generated: {dt.datetime.now():%d %b %Y, %H:%M}", "", f"## Overall score: {result['score']}/100", f"Core resume quality: {result['core_score']}/100", f"Role match: {result['match_score']}/100", "", "## Recommended next moves"]
+    lines.extend(f"- **{title}:** {detail}" for title, detail in result["suggestions"])
+    if result["missing_terms"]:
+        lines += ["", "## Missing role terms", ", ".join(result["missing_terms"])]
+    if result["terms"]:
+        ats = ats_scan(resume_text, job_description, result)
+        lines += ["", "## Tailored professional summary", tailored_summary(result), "", "## ATS scan snapshot", f"- Extracted words: {ats['word_count']}", f"- Role-term mentions: {ats['keyword_hits']}", f"- Keyword density: {ats['density']}%"]
+        lines.extend(f"- **{title}:** {detail}" for title, detail in ats["issues"])
+        lines += ["", "## Interview practice"]
+        lines.extend(f"{index}. {question}" for index, question in enumerate(interview_questions(result), 1))
+        roadmap = skill_roadmap(job_description, result)
+        if roadmap:
+            lines += ["", "## Skill roadmap"]
+            lines.extend(f"- **{priority} - {skill.title()}:** {action}" for skill, priority, action in roadmap)
+    return "\n".join(lines)
+
+
+def mock_ai_feedback(result):
+    """Retain the original AI strategy layer, with concrete language from the newer scoring model."""
+    if not result["terms"]:
+        return "Add a target job description to unlock a role-specific strategy. Your current priorities are to strengthen evidence of impact and make the most relevant achievements easier to find."
+    match = result["match_score"]
+    confidence = "High" if match >= 80 else "Medium" if match >= 60 else "Developing"
+    missing = ", ".join(result["missing_terms"][:4])
+    return f"**Match confidence: {confidence}.** Your role alignment is **{match}%**. " + (
+        "Your resume already reflects much of the language recruiters are likely to scan for. Move your strongest matched skills and outcomes nearer the top."
+        if match >= 70 else
+        f"Focus your next edit on translating real experience into the role's vocabulary — especially: **{missing or 'the missing priority terms'}**. Add those terms only beside evidence that proves them."
+    )
+
+
+def build_audio_summary(result, rate=165, volume=1.0, voice_id=None):
+    """Restore configurable voice playback with pyttsx3 and gTTS fallback."""
+    message = (
+        f"Your overall resume readiness score is {result['score']} out of 100. "
+        f"Your core resume quality is {result['core_score']}. "
+        + (f"Your match to the target role is {result['match_score']} percent. " if result["terms"] else "")
+        + "Your next priority is: "
+        + (result["suggestions"][0][1] if result["suggestions"] else "tailoring your strongest achievements for the role.")
+    )
+    if TTS_AVAILABLE:
+        descriptor, path = tempfile.mkstemp(suffix=".wav", prefix="resume_insight_")
+        os.close(descriptor)
         try:
             engine = pyttsx3.init()
-            
-            try:
-                engine.setProperty('rate', int(rate))
-                engine.setProperty('volume', float(volume))
-            except Exception:
-                pass
+            engine.setProperty("rate", rate)
+            engine.setProperty("volume", volume)
             if voice_id:
-                try:
-                    engine.setProperty('voice', voice_id)
-                except Exception:
-                    pass
-
-            fd, tmp_path = tempfile.mkstemp(suffix='.wav', prefix='resume_tts_')
-            os.close(fd)
-            audio_bytes = None
-            try:
-                engine.save_to_file(text, tmp_path)
-                engine.runAndWait() # This blocks until the audio file is written
-                
-                if os.path.exists(tmp_path): 
-                    with open(tmp_path, 'rb') as f:
-                        audio_bytes = f.read()
-            finally:
-                try:
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
-                except Exception:
-                    pass
-            
-            if audio_bytes:
-                return audio_bytes
-        except Exception as e:
-            print(f'pyttsx3 error: {e}')
-
-    if _GTTS_AVAILABLE:
+                engine.setProperty("voice", voice_id)
+            engine.save_to_file(message, path)
+            engine.runAndWait()
+            with open(path, "rb") as audio_file:
+                return audio_file.read(), "audio/wav"
+        except Exception:
+            pass
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+    if GTTS_AVAILABLE:
         try:
-            from gtts import gTTS # Re-import locally for clarity
-            tts = gTTS(text)
-            buf = io.BytesIO()
-            tts.write_to_fp(buf)
-            buf.seek(0)
-            return buf.read()
-        except Exception as e:
-            print(f'gTTS error: {e}')
-
-    return None
-
-# Function to display the file
-def display_resume_preview(uploaded_file, resume_text=""):
-    """Display resume with styled formatting for a professional appearance."""
-    ext = uploaded_file.name.split(".")[-1].lower()
-    
-    uploaded_file.seek(0)
-    
-    if ext == "pdf":
-        # PDF display with styled container
-        st.markdown("### 📄 PDF Resume Preview")
-        base64_pdf = base64.b64encode(uploaded_file.read()).decode('utf-8')
-        pdf_display = f'<div class="resume-preview-pdf"><iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="800" type="application/pdf"></iframe></div>'
-        st.markdown(pdf_display, unsafe_allow_html=True)
-        
-    elif ext == "docx":
-        # DOCX display with styled text formatting
-        st.markdown("### 📄 DOCX Resume Preview")
-        if resume_text:
-            # Create a styled text display
-            st.markdown(f'<div class="resume-preview-container"><div class="resume-content-text">{resume_text[:3000]}</div></div>', 
-                       unsafe_allow_html=True)
-        else:
-            st.write("DOCX file uploaded. Extracting content...")
-    else:
-        st.warning("Preview not available for this file type.")
-
-def display_file(uploaded_file):
-    ext = uploaded_file.name.split(".")[-1].lower()
-    
-    uploaded_file.seek(0)
-    
-    if ext == "pdf":
-        base64_pdf = base64.b64encode(uploaded_file.read()).decode('utf-8')
-        pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="700" height="1000" type="application/pdf"></iframe>'
-        st.markdown(pdf_display, unsafe_allow_html=True)
-    elif ext == "docx":
-        st.write("DOCX file uploaded. Displaying as text preview as a full document preview is not supported.")
-        uploaded_file.seek(0)
-        preview_text = extract_text(uploaded_file)
-        st.info("DOCX file content: " + preview_text[:1000] + "...")
-    else:
-        st.warning("Preview not available for this file type.")
+            buffer = io.BytesIO()
+            gTTS(message).write_to_fp(buffer)
+            return buffer.getvalue(), "audio/mp3"
+        except Exception:
+            pass
+    return None, None
 
 
-# ==================================================
-# Analyzer Logic & Constants
-# ==================================================
-# Centralized Constants
-CONSTANTS = {
-    "SKILLS": ["python", "java", "sql", "excel", "aws", "tableau", "spark", "pandas", "numpy", "hadoop", "c++", "javascript", "react", "docker"],
-    "KEYWORDS": ["machine learning", "data analysis", "communication", "leadership", "teamwork", "project management", "problem solving", "adaptability"],
-    "DEGREES": ["bachelor", "master", "phd", "mba"],
-    "ACTION_VERBS": ["managed", "developed", "led", "created", "designed", "implemented", "analyzed", "optimized", "collaborated", "achieved"]
-}
+with st.sidebar:
+    st.markdown("<div class='brand-mark'><div class='brand-icon'>R</div><div><div class='brand-name'>Resume Insight</div><div class='brand-subtitle'>Application intelligence</div></div></div>", unsafe_allow_html=True)
+    page = st.radio("Navigation", ["Home", "Analyze", "History"], label_visibility="collapsed")
+    st.divider()
+    st.markdown("**Your workflow**")
+    st.caption("01  Upload a resume\n\n02  Add a target role\n\n03  Make evidence-led edits")
 
 
-def analyze(text, job_description_text=""):
-    if not text:
-        return {}
-        
-    # --- Structural Analysis ---
-    
-    # Check for contact info
-    contact_info = {
-        "email": bool(re.search(r'\S+@\S+', text)),
-        "phone": bool(re.search(r'\+?\d{1,4}?[-.\s]?\(?\d{1,3}?\)?[-.\s]?\d{1,4}[-.\s]?\d{1,4}[-.\s]?\d{1,9}', text)),
-        "linkedin": bool(re.search(r'linkedin\.com\/in\/', text)),
-        "github": bool(re.search(r'github\.com\/', text))
-    }
-    
-    # Section Score Calculation
-    sections = {
-        "Experience": 100 if "experience" in text or "project" in text else 50,
-        "Education": 100 if any(d in text for d in CONSTANTS["DEGREES"]) else 50,
-        # Score based on number of technical skills found
-        "Skills": min(100, int(sum(1 for s in CONSTANTS["SKILLS"] if s in text) * (100 / len(CONSTANTS["SKILLS"])))), 
-        "Projects": 100 if "project" in text else 50
-    }
-    core_score = int(sum(sections.values()) / len(sections))
-
-    # Action Verbs and Quantifiable Metrics
-    num_metrics = len(re.findall(r'(\d+%|(\$|€|£)\d+|(\d+\s+million)|(\d+\s+thousand))', text))
-    action_verb_count = sum(1 for verb in CONSTANTS["ACTION_VERBS"] if verb in text)
-    
-    # --- Keyword Matching ---
-    match_score = 0
-    jd_keywords_found = {}
-    if job_description_text:
-        jd_text_lower = job_description_text.lower()
-        # Combine predefined skills/keywords with 5 most frequent non-stop words from JD
-        all_jd_terms = set(CONSTANTS["SKILLS"] + CONSTANTS["KEYWORDS"])
-        
-        # Simple tokenization for JD: find words of length > 3
-        words = re.findall(r'\b[a-z]{4,}\b', jd_text_lower)
-        word_counts = Counter(words)
-        
-        # Add top 5 unique words from JD
-        for word, count in word_counts.most_common(5):
-            all_jd_terms.add(word)
-             
-        total_unique_jd_terms = len(all_jd_terms)
-        matched_terms = 0
-        
-        for term in all_jd_terms:
-            if term in text:
-                matched_terms += 1
-                jd_keywords_found[term] = True
-            
-        if total_unique_jd_terms > 0:
-            match_score = int((matched_terms / total_unique_jd_terms) * 100)
-        
-        # Adjust overall score slightly by the match score (70% core, 30% match)
-        final_score = int((core_score * 0.7) + (match_score * 0.3))
-    else:
-        final_score = core_score
-        match_score = 0
-    
-    # --- Dynamic Feedback Generation ---
-    feedback = []
-    if not contact_info["email"] or not contact_info["phone"]:
-        feedback.append("Ensure your resume has clear contact information (email & phone).")
-    if not contact_info["linkedin"]:
-        feedback.append("Add a link to your LinkedIn profile to showcase your professional network.")
-    if num_metrics < 3:
-        feedback.append("Use more quantifiable metrics (e.g., 'Increased sales by 15%', 'Managed a $1M budget').")
-    if action_verb_count < 5:
-        feedback.append("Start your bullet points with strong action verbs to show impact.")
-
-    missing_skills = [s for s in CONSTANTS["SKILLS"] if s not in text]
-    missing_keywords = [k for k in CONSTANTS["KEYWORDS"] if k not in text]
-    
-    if sections["Skills"] < 50 and missing_skills:
-        feedback.append(f"Consider adding technical skills like: {', '.join(missing_skills[:5])}")
-    if missing_keywords:
-        feedback.append(f"Include soft skills and keywords relevant to your field: {', '.join(missing_keywords[:3])}")
-    if sections["Education"] < 100:
-        feedback.append("Clearly mention your degrees and institutions.")
-    if sections["Experience"] < 100:
-        feedback.append("Add more detail on work/project experience, highlighting achievements.")
-        
-    if job_description_text and match_score < 70:
-        feedback.append(f"Your resume match is **{match_score}%**. You are likely missing job-specific keywords. Tailor your language!")
-        
-    if not feedback:
-        feedback.append("Your resume looks great! It's well-structured and impactful.")
-
-
-    exp_years = sum(int(y) for y in re.findall(r'(\d+)\s+years?', text))
-    readability = int(flesch_reading_ease(text)) if text.strip() else 0
-    projects_count = len(re.findall(r'project', text))
-    skill_counts = Counter([s for s in CONSTANTS["SKILLS"] if s in text])
-
-    return {
-        "score": final_score,
-        "core_score": core_score,
-        "match_score": match_score, 
-        "sections": sections,
-        "feedback": feedback,
-        "exp_years": exp_years,
-        "readability": readability,
-        "projects_count": projects_count,
-        "skill_counts": skill_counts,
-        "num_metrics": num_metrics,
-        "action_verb_count": action_verb_count,
-        "jd_keywords_found": jd_keywords_found 
-    }
-
-# --- AI Mock Function (Placeholder) ---
-def mock_ai_analysis(resume_text, job_description_text, result):
-    if not job_description_text:
-        return "I need a job description to provide personalized AI insights."
-
-    match = result.get('match_score', 0)
-    
-    ai_feedback = f"Based on your resume and the provided Job Description, here is a deeper AI-driven assessment:\n\n"
-    ai_feedback += f"### Match Confidence: {'High' if match >= 80 else ('Medium' if match >= 60 else 'Low')}\n"
-    
-    if match >= 80:
-        ai_feedback += f"**Excellent fit!** Your resume strongly reflects the required skills and experience. Ensure your quantified achievements are the first thing recruiters see."
-    elif match >= 60:
-        ai_feedback += f"**Good potential.** Your core score is solid, but the match to the JD (**{match}%**) can be improved. Focus on incorporating the most frequent terms from the job description directly into your bullet points, especially if they relate to project management or core tools."
-    else:
-        ai_feedback += f"**Moderate fit.** To increase your chances, a significant revision is needed. The system detected a low keyword match (**{match}%**). Revamp your Experience section to use the specific technologies and responsibilities listed in the job description."
-
-    return ai_feedback
-
-# ==================================================
-# Home Page
-# ==================================================
 if page == "Home":
-    st.markdown(
-        """
-        <div style="text-align:center; padding:30px; background:linear-gradient(120deg, #74ebd5, #ACB6E5);
-                    border-radius:15px; color:white; margin-bottom:25px;">
-            <h1 style="font-size:40px; margin-bottom:10px;">📄 Resume Insight Pro+</h1>
-            <p style="font-size:18px; line-height:1.6;">
-                Your AI-powered companion to analyze, score, and enhance your resume instantly 🚀
-            </p>
+    st.markdown("""<section class='hero'><div class='eyebrow'>Resume intelligence, made practical</div><h1>Build a resume recruiters can scan with confidence.</h1><p>Analyze structure, evidence of impact, and alignment to a specific role — then leave with a focused edit plan.</p></section>""", unsafe_allow_html=True)
+    st.write("")
+    left, right = st.columns([1.25, 1])
+    with left:
+        st.subheader("A sharper application workflow")
+        for number, title, copy in [("1", "Upload once", "Bring in a text-based PDF or DOCX and check the extracted preview."), ("2", "Tailor intentionally", "Paste the role description to surface the language that matters for this application."), ("3", "Edit with purpose", "Use a prioritized checklist, skill coverage, and downloadable report to make the next revision count.")]:
+            st.markdown(f"<div class='step'><div class='step-num'>{number}</div><div><b>{title}</b><br><span class='small-muted'>{copy}</span></div></div>", unsafe_allow_html=True)
+    with right:
+        st.markdown("<div class='insight-card'><h3>What’s new in the experience</h3><p>Role-keyword coverage, a concise action plan, an ATS-style readiness checklist, comparison-friendly history, and a portable report for every analysis.</p></div>", unsafe_allow_html=True)
+        st.write("")
+        st.info("Tip: paste the exact job description. The match view is most useful when it reflects the role you plan to apply for.")
+    st.write("")
+    st.subheader("Designed for the decisions that matter")
+    cards = st.columns(3)
+    content = [("Role alignment", "See which relevant terms already appear in your resume and which deserve a truthful, evidence-backed mention."), ("Impact signal", "Track action verbs, quantified achievements, structure, and contact completeness in one glance."), ("Progress over time", "Keep a lightweight private record of analyses so revisions become visible, not vague.")]
+    for col, (title, copy) in zip(cards, content):
+        with col:
+            st.markdown(f"<div class='feature-card'><h3>{title}</h3><p>{copy}</p></div>", unsafe_allow_html=True)
+
+elif page == "Analyze":
+    st.markdown("<section class='analysis-hero'><div class='page-kicker'>Resume review workspace</div><h1>Make every application more convincing.</h1><p>Upload your resume and a target role to surface the strongest edits, evidence gaps, and ATS signals before you apply.</p></section>", unsafe_allow_html=True)
+    st.markdown("""
+        <div class='workflow-strip'>
+          <div class='workflow-item active'><strong><span class='workflow-number'>1</span>Add your resume</strong>Upload a text-based PDF or DOCX.</div>
+          <div class='workflow-item active'><strong><span class='workflow-number'>2</span>Add the role</strong>Paste the job post for a tailored match score.</div>
+          <div class='workflow-item'><strong><span class='workflow-number'>3</span>Review your plan</strong>Create a report, then use the clearly labelled tools below.</div>
         </div>
-        """,
-        unsafe_allow_html=True
-    )
+    """, unsafe_allow_html=True)
+    upload_col, role_col = st.columns([1, 1.15], gap="large")
+    with upload_col:
+        st.markdown("**Required: your resume**")
+        uploaded = st.file_uploader("Resume file", type=["pdf", "docx"], help="Use a text-based PDF or DOCX. Scanned PDFs may not contain extractable text.")
+        st.caption("PDF or DOCX · text-based files work best")
+    with role_col:
+        st.markdown("**Recommended: target job description**")
+        job_description = st.text_area("Target job description (recommended)", height=166, placeholder="Paste responsibilities, required skills, and qualifications here…", help="This unlocks role match and keyword coverage.")
 
-    st.write("Welcome to **Resume Insight Pro+**! 🎯 Upload your resume and let AI guide you towards career success.")
-    st.markdown("Use the sidebar to navigate to **AI Analyzer** and get detailed insights on your resume.")
+    st.caption("Tip: paste the exact job post to make the match score more useful.")
 
-    st.markdown("---")
-    st.subheader("✨ Key Features")
+    resume_text, file_name = "", "Resume"
+    if uploaded:
+        file_name, file_bytes = uploaded.name, uploaded.getvalue()
+        try:
+            with st.spinner("Reading your resume…"):
+                resume_text = extract_text(file_bytes, uploaded.name)
+        except Exception:
+            st.error("I couldn't read this file. Please try a different PDF/DOCX or export it again.")
+        if resume_text.strip():
+            meta1, meta2, meta3 = st.columns(3)
+            meta1.metric("File", uploaded.name)
+            meta2.metric("Size", f"{len(file_bytes) / 1024:.0f} KB")
+            meta3.metric("Extracted words", len(re.findall(r"\b\w+\b", resume_text)))
+            render_resume_preview(file_bytes, uploaded.name, resume_text)
+            with st.expander("Review extracted resume text", expanded=False):
+                st.text(resume_text[:8000])
+        else:
+            st.warning("No readable text was found. If this is a scan, use a text-based export before analyzing.")
 
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.markdown("📊 **Resume Score Calculation** – Get an instant score with a dynamic pie chart.")
-        st.markdown("🧠 **Skills & Keyword Analysis** – Detect missing technical and job-relevant keywords.")
-        st.markdown("💬 **Soft Skills Feedback** – Improve communication, teamwork, and leadership impact.")
-
-    with col2:
-        st.markdown("🎓 **Experience & Education Metrics** – Validate your academic and career journey.")
-        st.markdown("☁️ **Skill Word Cloud** – Visualize top skills mentioned in your resume.")
-        st.markdown("📜 **Resume History** – Track past uploads and measure your improvements.")
-        st.markdown("📄 **Live Resume Preview** – See a clear front view of your uploaded resume.")
-        st.markdown("🎯 **Job Description Match Score** – Tailor your resume for a specific job.")
-        st.markdown("🔊 **Voice Summary** - Hear an audio summary of your results with modulation.")
-
-    st.markdown("---")
-    st.subheader("💡 How It Works")
-    st.markdown(
-        """
-        1. 📂 Upload your resume (PDF/DOCX).
-        2. 📝 **(NEW)** Paste the **Job Description** you are applying for.
-        3. 🤖 AI extracts text and evaluates your resume against the JD.
-        4. 📈 See an **animated score chart** and improvement areas, including a **Match Score**.
-        5. 📝 Review personalized **feedback & suggestions**.
-        6. 📊 Explore **history of previous uploads** and progress over time.
-        """
-    )
-
-    st.success("👉 Head over to the **AI Analyzer** in the sidebar and upload your resume now!")
-
-# ==================================================
-# Analyzer Page (Enhanced)
-# ==================================================
-elif page == "AI Analyzer":
-    st.markdown("<h1 style='text-align:center;color:#2C3E50;'>🔍 AI Resume Analyzer</h1>", unsafe_allow_html=True)
-    
-    # --- File Upload & JD Input ---
-    
-    col_upload, col_jd = st.columns(2)
-    
-    with col_upload:
-        uploaded_resume = st.file_uploader("1. Upload your resume (PDF or DOCX)", type=["pdf", "docx"], key="resume_uploader")
-    
-    with col_jd:
-        job_description_text = st.text_area(
-            "2. Paste the **Job Description** here (Optional but Recommended for Match Score)", 
-            height=200,
-            placeholder="e.g., Responsibilities include developing Python scripts, managing AWS infrastructure, and collaborating with the Data Science team...",
-            key="jd_text_area"
-        )
-
-    resume_text = ""
-    file_details = {}
-    
-    if uploaded_resume:
-        uploaded_resume.seek(0) 
-        
-        file_details = {
-            "Filename": uploaded_resume.name,
-            "File Size (KB)": round(len(uploaded_resume.getbuffer()) / 1024, 2),
-            "Upload Time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    st.divider()
+    action_col, note_col = st.columns([1, 1.8], vertical_alignment="center")
+    with action_col:
+        analyze_clicked = st.button("Create my insight report", type="primary", use_container_width=True, disabled=not bool(resume_text.strip()))
+    with note_col:
+        st.markdown("<div class='visibility-note'><b>Private by design.</b> Your document is processed in this local app. Add only keywords you can support with real experience.</div>", unsafe_allow_html=True)
+    if analyze_clicked:
+        result = analyze(resume_text, job_description)
+        st.session_state["latest_analysis"] = {
+            "result": result,
+            "file_name": file_name,
+            "has_jd": bool(job_description.strip()),
+            "resume_text": resume_text,
+            "job_description": job_description,
         }
-        st.json(file_details)
+        save_history({"timestamp": dt.datetime.now().isoformat(timespec="seconds"), "file_name": file_name, "overall_score": result["score"], "match_score": result["match_score"], "readability": result["readability"], "top_skills": result["skills"][:6], "feedback_summary": result["suggestions"][0][1] if result["suggestions"] else "Strong baseline — keep tailoring for each role."})
+        st.toast("Analysis saved to History", icon="✅")
 
-        # Show resume preview prominently
-        uploaded_resume.seek(0)
-        
-        with st.spinner("Extracting text from your resume..."):
-            resume_text = extract_text(uploaded_resume)
-        
-        # Display resume with styled preview
-        st.markdown("---")
-        st.markdown("### 👀 Resume Front Display")
-        display_resume_preview(uploaded_resume, resume_text)
-        st.markdown("---")
+    latest = st.session_state.get("latest_analysis")
+    if latest:
+        result = latest["result"]
+        st.divider()
+        st.markdown("<div class='report-header'><h2>Your insight report</h2><span class='report-badge'>● Analysis complete</span></div>", unsafe_allow_html=True)
+        st.caption(f"Based on {latest['file_name']}" + (" and the target job description." if latest["has_jd"] else ". Add a job description next time for a role-match score."))
+        score_cols = st.columns(3)
+        with score_cols[0]: score_orb(result["score"], "overall readiness")
+        with score_cols[1]: score_orb(result["core_score"], "resume quality")
+        with score_cols[2]: score_orb(result["match_score"], "role match" if latest["has_jd"] else "add a target role")
 
-    st.markdown("---")
-    
-    if st.button("🚀 Analyze Resume", type="primary", key="analyze_button"):
-        # Reset TTS audio bytes when running new analysis
-        st.session_state['tts_audio_bytes'] = None 
-        
-        if not uploaded_resume:
-            st.error("Please upload a valid resume first!")
-            st.stop()
-        elif not resume_text:
-            st.error("Text extraction failed. Please check the file format (must be a text-based PDF or DOCX).")
-            st.stop()
-        else:
-            # Set a session state flag to trigger result display
-            st.session_state['analysis_performed'] = True
-            st.session_state['result'] = analyze(resume_text, job_description_text)
-            st.session_state['file_details'] = file_details
-            # Flag to trigger metric animation classes
-            st.session_state['metric_class'] = 'metric-flash'
-            
-            # Save History immediately after analysis
-            result = st.session_state['result']
-            new_history_entry = {
-                "file_name": uploaded_resume.name,
-                "timestamp": file_details["Upload Time"],
-                "overall_score": result["score"],
-                "match_score": result["match_score"],
-                "readability": result["readability"],
-                "exp_years": result["exp_years"],
-                "top_skills": dict(result["skill_counts"].most_common(5)),
-                "feedback_summary": result["feedback"][0]
-            }
-            save_history(new_history_entry)
-            st.toast("✅ Analysis saved to History!", icon='📜')
-            st.rerun() # Rerun to display results clearly
-
-    # --- Results Display (Conditional on analysis being performed) ---
-    if st.session_state.get('analysis_performed', False):
-        result = st.session_state['result']
-        file_details = st.session_state['file_details']
-        
-        st.subheader("📊 Analysis Results")
-        
-        col_score, col_match = st.columns(2)
-        
-        with col_score:
-            st.markdown("#### Overall Weighted Score")
-            st.write("Structural compliance, skills, and JD match combined.")
-            animated_score_chart(result["score"])
-            st.info(f"Structural Score (Without JD Match): **{result['core_score']}%**")
-            
-        with col_match:
-            if job_description_text:
-                st.markdown("#### Job Description Match Score 🎯")
-                st.write("Percentage of JD keywords found in your resume.")
-                animated_score_chart(result["match_score"], size=(2.8, 2.8), font_size=18, thickness=0.4) 
+        overview, alignment, checklist, strategy, toolkit = st.tabs(["Action plan", "Role alignment", "ATS review", "Strategy", "Career toolkit"])
+        with overview:
+            st.markdown("<div class='section-lead'><div class='section-eyebrow'>Your edit sequence</div><h3>Start with the changes that move the score.</h3><p>Work through these actions from top to bottom. Each recommendation comes from a visible signal in your uploaded resume.</p></div>", unsafe_allow_html=True)
+            if result["suggestions"]:
+                for index, (title, detail) in enumerate(result["suggestions"], 1):
+                    st.markdown(f"<div class='step'><div class='step-num'>{index}</div><div><b>{html.escape(title)}</b><br><span class='small-muted'>{html.escape(detail)}</span></div></div>", unsafe_allow_html=True)
             else:
-                st.warning("Paste a Job Description above to get a **Match Score**!")
-                
-        st.markdown("---")
-
-        # --- AI/LLM MOCK FEEDBACK ---
-        st.subheader("🤖 AI-Driven Strategy & Feedback")
-        with st.container(border=True):
-             ai_feedback = mock_ai_analysis(resume_text, job_description_text, result)
-             st.markdown(ai_feedback)
-        
-        st.markdown("---")
-
-        # --- Feedback & Suggestions ---
-        st.subheader("💬 Structural Feedback & Quick Wins")
-        with st.container(border=True):
-            for f in result["feedback"]:
-                if "Ensure" in f or "Add" in f or "Consider" in f or "Include" in f or "missing job-specific" in f or "Revamp" in f:
-                    st.warning(f)
+                st.success("Strong foundation. Tailor your wording and order of achievements for each role.")
+            st.download_button("Download full report (.md)", report_markdown(result, latest["file_name"], latest.get("resume_text", ""), latest.get("job_description", "")), file_name="resume-insight-report.md", mime="text/markdown")
+            with st.expander("Listen to your insight summary"):
+                if TTS_AVAILABLE or GTTS_AVAILABLE:
+                    voice_id = None
+                    control_left, control_right, control_voice = st.columns(3)
+                    with control_left:
+                        rate = st.slider("Speech rate", 80, 250, 165, key="summary_rate")
+                    with control_right:
+                        volume = st.slider("Volume", 0.1, 1.0, 1.0, step=0.1, key="summary_volume")
+                    if TTS_AVAILABLE:
+                        try:
+                            voice_engine = pyttsx3.init()
+                            voices = voice_engine.getProperty("voices")
+                            voice_labels = {voice.id: getattr(voice, "name", voice.id) for voice in voices}
+                            with control_voice:
+                                voice_id = st.selectbox("Voice", list(voice_labels), format_func=lambda item: voice_labels[item], key="summary_voice")
+                            voice_engine.stop()
+                        except Exception:
+                            pass
+                    if st.button("Generate voice summary", key="voice_summary"):
+                        with st.spinner("Generating audio summary…"):
+                            audio, audio_format = build_audio_summary(result, rate, volume, voice_id)
+                            st.session_state["insight_audio"] = audio
+                            st.session_state["insight_audio_format"] = audio_format
+                        if not st.session_state["insight_audio"]:
+                            st.warning("Audio could not be generated by the available voice engine.")
+                    if st.session_state.get("insight_audio"):
+                        st.audio(st.session_state["insight_audio"], format=st.session_state.get("insight_audio_format", "audio/wav"))
                 else:
-                    st.success(f)
-        
-        st.markdown("---")
-        
-        # --- Section Scores and Metrics ---
-        st.subheader("📂 Section-wise Scores & Key Metrics")
-        
-        col_metrics, col_sections = st.columns([1.5, 2])
-        
-        # 1. Metric Flash Animation
-        metric_class = st.session_state.get('metric_class', '')
-        
-        with col_metrics:
-            st.markdown("##### Resume Insights")
-            
-            st.markdown(f'<div class="metric-container {metric_class}">', unsafe_allow_html=True)
-            st.metric("Experience Years", result['exp_years'])
-            st.markdown('</div>', unsafe_allow_html=True)
+                    st.caption("Install pyttsx3 for local speech or gTTS for the online fallback.")
+        with alignment:
+            st.markdown("<div class='section-lead'><div class='section-eyebrow'>Target-role fit</div><h3>Compare your evidence with the job language.</h3><p>Use missing terms only when a genuine achievement, project, or skill can support them.</p></div>", unsafe_allow_html=True)
+            if not latest["has_jd"]:
+                st.info("Paste a target job description above, then create a new report to see matching and missing role terms.")
+            else:
+                left, right = st.columns(2)
+                with left:
+                    st.markdown("<div class='alignment-panel covered'><h4>Covered in your resume</h4><p>Terms already supported by your content.</p>" + tag_markup(result["matched_terms"]) + "</div>", unsafe_allow_html=True)
+                with right:
+                    st.markdown("<div class='alignment-panel gaps'><h4>Potentially missing terms</h4><p>Opportunities to add evidence, not keyword stuffing.</p>" + tag_markup(result["missing_terms"], missing=True) + "</div>", unsafe_allow_html=True)
+                st.caption("Use only terms you can support with real experience. The goal is clarity, not keyword stuffing.")
+        with checklist:
+            st.markdown("<div class='section-lead'><div class='section-eyebrow'>Parser and recruiter check</div><h3>Make the important information easy to find.</h3><p>These signals reflect resume structure, contact completeness, evidence of impact, and scan-friendly language.</p></div>", unsafe_allow_html=True)
+            left, right = st.columns([1.15, 1])
+            with left:
+                st.markdown("**Section completeness**")
+                for label, value in result["sections"].items(): progress(label, value)
+            with right:
+                st.markdown("**Resume signals**")
+                for label, passed in result["contact"].items():
+                    st.write(("✅" if passed else "○") + f" {label}")
+                st.write("")
+                st.metric("Action verbs", result["action_count"], help="Strong verbs make achievement bullets easier to scan.")
+                st.metric("Quantified outcomes", result["metrics_count"], help="A percentage, scale, money value, or concrete volume counts as evidence.")
+                st.metric("Readability", f"{result['readability']}/100", help="Aim for concise, skimmable language rather than a perfect score.")
+                st.metric("Experience years", result["exp_years"])
+                st.metric("Project mentions", result["projects_count"])
+        with strategy:
+            st.markdown("<div class='section-lead'><div class='section-eyebrow'>Application strategy</div><h3>Turn the analysis into a focused narrative.</h3><p>Use this as a decision guide while revising your summary, skills ordering, and achievement bullets.</p></div>", unsafe_allow_html=True)
+            strategy_text = html.escape(mock_ai_feedback(result)).replace("**", "")
+            st.markdown("<div class='strategy-card'><p>" + strategy_text + "</p></div>", unsafe_allow_html=True)
+            st.caption("Guidance is based on structural signals and the supplied job description. Validate every recommendation against your actual experience.")
+        with toolkit:
+            resume_source = latest.get("resume_text", "")
+            job_source = latest.get("job_description", "")
+            st.markdown("<div class='toolkit-heading'>Evidence and revision lab</div>", unsafe_allow_html=True)
+            st.markdown("<p class='toolkit-subtitle'>Explore the evidence behind your score, test possible improvements, and compare a revised resume. These tools are read-only until you choose to update your document.</p>", unsafe_allow_html=True)
+            st.markdown("""
+                        <div class='tool-index'>
+                            <div class='tool-index-card'><strong>1. Evidence traceability</strong><span>See which resume lines support each score.</span></div>
+                            <div class='tool-index-card'><strong>2. Claim review</strong><span>Review certifications, expertise, and outcome claims.</span></div>
+                            <div class='tool-index-card'><strong>3. Score simulator</strong><span>Preview the impact of possible improvements.</span></div>
+                            <div class='tool-index-card'><strong>4. Compare versions</strong><span>Measure changes between two resume drafts.</span></div>
+                            <div class='tool-index-card'><strong>5. Gap coach</strong><span>Turn missing role terms into evidence-first templates.</span></div>
+                            <div class='tool-index-card'><strong>6. ATS scan</strong><span>Check parser-friendly structure and keyword balance.</span></div>
+                            <div class='tool-index-card'><strong>7. Interview practice</strong><span>Generate role-focused questions from your analysis.</span></div>
+                            <div class='tool-index-card'><strong>8. Professional summary</strong><span>Draft a truthful, role-aligned summary.</span></div>
+                            <div class='tool-index-card'><strong>9. Skill roadmap</strong><span>Prioritize skills explicitly requested by the role.</span></div>
+                        </div>
+            """, unsafe_allow_html=True)
+            st.markdown("<div class='visibility-note'><b>All nine tools are available below.</b> Their titles and purpose are listed above; open only the tool you need. Evidence traceability and gap coaching are expanded first because they are the most useful places to start.</div>", unsafe_allow_html=True)
+            if not latest["has_jd"]:
+                st.info("Add a target job description and create a new report to unlock role-specific gap coaching, interview questions, and a skills roadmap.")
 
-            st.markdown(f'<div class="metric-container {metric_class}">', unsafe_allow_html=True)
-            st.metric("Projects", result['projects_count'])
-            st.markdown('</div>', unsafe_allow_html=True)
-            
-            st.markdown(f'<div class="metric-container {metric_class}">', unsafe_allow_html=True)
-            st.metric("Readability (Flesch)", result['readability'], help="Aim for 60-70 for professional reading ease.")
-            st.markdown('</div>', unsafe_allow_html=True)
-            
-            st.markdown(f'<div class="metric-container {metric_class}">', unsafe_allow_html=True)
-            st.metric("Action Verbs", result['action_verb_count'])
-            st.markdown('</div>', unsafe_allow_html=True)
-            
-            st.markdown(f'<div class="metric-container {metric_class}">', unsafe_allow_html=True)
-            st.metric("Quantifiable Metrics", result['num_metrics'], help="Number of times currency, percentages, or large numbers are used to show impact.")
-            st.markdown('</div>', unsafe_allow_html=True)
-
-
-        with col_sections:
-            st.markdown("##### Structural Completion (Animated)")
-            st.markdown("<div class='section-scores'>", unsafe_allow_html=True)
-            # 2. Custom Animated Progress Bars
-            for k, v in result["sections"].items():
-                animated_progress_bar(k, v)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        # Clear the flash class after use
-        st.session_state['metric_class'] = '' 
-
-        st.markdown("---")
-        
-        # --- Word Cloud ---
-        if result["skill_counts"]:
-            st.subheader("☁️ Skill Cloud")
-            st.write("This shows the frequency of detected technical skills in your resume.")
-            word_freqs = {k: v for k, v in result["skill_counts"].items()}
-            
-            wc = WordCloud(width=600, height=300, background_color="white").generate_from_frequencies(word_freqs)
-            plt.figure(figsize=(8, 4))
-            plt.imshow(wc, interpolation="bilinear")
-            plt.axis("off")
-            st.pyplot(plt)
-            plt.close() 
-            
-        # --- Voice Modulation / Audio Summary (FIXED: Uses Session State) ---
-        st.markdown("---")
-        st.subheader("🔊 Voice Summary (Modulation)")
-        
-        if not _PYTTSX3_AVAILABLE and not _GTTS_AVAILABLE:
-            st.error('No TTS engine available. Install `pyttsx3` (for local modulation) or `gTTS` (for online fallback).')
-        else:
-            col_v1, col_v2, col_v3 = st.columns([2,1,1])
-            
-            tts_rate = st.slider("Speech Rate (Words/Min)", 80, 250, 150, key='tts_rate')
-            tts_volume = st.slider("Volume", 0.1, 1.0, 1.0, step=0.1, key='tts_volume')
-            
-            selected_voice = None
-            if _PYTTSX3_AVAILABLE:
-                try:
-                    engine_tmp = pyttsx3.init()
-                    voices = engine_tmp.getProperty('voices')
-                    voice_options = {v.id: getattr(v, 'name', v.id) for v in voices}
-                    
-                    with col_v3: 
-                         selected_voice = st.selectbox('Voice', options=list(voice_options.keys()), format_func=lambda x: voice_options.get(x, x), key='tts_voice_select')
-                    engine_tmp.stop()
-                except Exception:
-                    pass
-            
-            summary_text = st.text_area('Optional: Edit the audio summary text', 
-                                        value=(f"Your resume scored {result['score']} out of 100. Readability is {result['readability']}. ATS match is {result['match_score']} percent."), 
-                                        height=120, key='tts_summary_text')
-
-            # --- TTS Button Logic: Store audio bytes in session state ---
-            if st.button('▶️ Play Voice Summary', key='tts_button_play'):
-                with st.spinner('Generating audio...'):
-                    # The function returns audio bytes
-                    audio_bytes = _speak_with_modulation(summary_text, rate=tts_rate, volume=tts_volume, voice_id=selected_voice)
-                    
-                    if audio_bytes:
-                        # Store audio bytes and format in session state
-                        st.session_state['tts_audio_bytes'] = audio_bytes
-                        st.session_state['tts_format'] = 'audio/wav' if _PYTTSX3_AVAILABLE else 'audio/mp3'
-                        st.success('Audio generated. Playing now.')
-                        st.rerun() # Rerun to display the audio widget outside the button block
+            with st.expander("1. Evidence traceability", expanded=True):
+                st.caption("See the resume lines behind each local score signal. This view explains the analysis without changing your document.")
+                for signal, status, matches, explanation in evidence_trace(resume_source, job_source, result):
+                    st.markdown(f"**{signal}** · {status}")
+                    st.caption(explanation)
+                    if matches:
+                        st.code("\n".join(matches), language=None)
                     else:
-                        st.error('Failed to generate audio. Check TTS installation or system configuration.')
-                        st.session_state['tts_audio_bytes'] = None
+                        st.caption("No supporting line was detected.")
 
-            # --- TTS Audio Display: Persistent outside the button block ---
-            if st.session_state['tts_audio_bytes'] is not None:
-                st.audio(
-                    st.session_state['tts_audio_bytes'], 
-                    format=st.session_state['tts_format']
-                )
+            with st.expander("2. Claim review", expanded=False):
+                st.caption("These are review prompts, not accusations. Confirm that strong claims are supported by real evidence.")
+                findings = claim_review(resume_source)
+                if not findings:
+                    st.success("No high-attention claims were detected by the local review rules.")
+                else:
+                    for label, line in findings:
+                        st.markdown(f"**{label}**")
+                        st.write(line)
 
-# ==================================================
-# History Page (FIXED: Robust Filtering)
-# ==================================================
-elif page == "History":
-    st.markdown("<h1 style='text-align:center;color:#2C3E50;'>📜 Analysis History</h1>", unsafe_allow_html=True)
-    
-    history_data = load_history()
-    
-    # Define required keys for a valid history entry
-    required_keys = ["timestamp", "overall_score", "match_score", "readability", "file_name", "top_skills", "feedback_summary"]
-    
-    # Filter out corrupted or incomplete entries (Fixes KeyError: 'timestamp')
-    valid_history = [
-        entry for entry in history_data 
-        if all(key in entry for key in required_keys)
-    ]
-    
-    if not history_data:
-        st.info("No analysis history found. Upload and analyze a resume on the 'AI Analyzer' page to start tracking your progress.")
-    elif not valid_history:
-        st.warning("History file found, but no **valid** analysis entries could be processed for charting. Please upload a new resume to create a valid entry, or manually inspect/clear `temp_uploads/history.json`.")
+            with st.expander("3. Score simulator", expanded=False):
+                st.caption("Preview the possible effect of improvements. Nothing here changes the original resume or saved history.")
+                simulate_left, simulate_right = st.columns(2)
+                with simulate_left:
+                    simulate_sections = st.checkbox("Complete missing sections", key="simulate_sections")
+                    simulate_contact = st.checkbox("Complete missing contact details", key="simulate_contact")
+                with simulate_right:
+                    simulate_impact = st.checkbox("Add stronger action verbs and 3 measurable outcomes", key="simulate_impact")
+                    simulate_role = st.checkbox("Address all missing role terms truthfully", key="simulate_role", disabled=not latest["has_jd"])
+                projected = simulated_score(result, {"sections": simulate_sections, "contact": simulate_contact, "impact": simulate_impact, "role": simulate_role})
+                sim_a, sim_b, sim_c = st.columns(3)
+                sim_a.metric("Projected overall", f"{projected[0]}/100", delta=projected[0] - result["score"])
+                sim_b.metric("Projected quality", f"{projected[1]}/100", delta=projected[1] - result["core_score"])
+                sim_c.metric("Projected role match", f"{projected[2]}/100", delta=projected[2] - result["match_score"] if latest["has_jd"] else None)
+
+            with st.expander("4. Compare resume versions", expanded=False):
+                st.caption("Upload a revised PDF/DOCX or paste a revision to see score movement and content changes side by side.")
+                comparison_file = st.file_uploader("Revised resume", type=["pdf", "docx"], key="comparison_resume")
+                revised_text = ""
+                if comparison_file:
+                    try:
+                        revised_text = extract_text(comparison_file.getvalue(), comparison_file.name)
+                    except Exception:
+                        st.error("The revised file could not be read. Try another PDF or DOCX.")
+                if not revised_text:
+                    revised_text = st.text_area("Or paste revised resume text", height=150, key="comparison_text")
+                if revised_text.strip():
+                    comparison = version_comparison(resume_source, revised_text, job_source)
+                    original_version, revised_version = comparison["original"], comparison["revised"]
+                    version_a, version_b, version_c = st.columns(3)
+                    version_a.metric("Overall score", f"{revised_version['score']}/100", delta=revised_version["score"] - original_version["score"])
+                    version_b.metric("Role match", f"{revised_version['match_score']}/100", delta=revised_version["match_score"] - original_version["match_score"] if latest["has_jd"] else None)
+                    version_c.metric("Readability", f"{revised_version['readability']}/100", delta=revised_version["readability"] - original_version["readability"])
+                    if comparison["added_sections"]:
+                        st.markdown("**Sections added:** " + ", ".join(comparison["added_sections"]))
+                    if comparison["removed_sections"]:
+                        st.markdown("**Sections removed:** " + ", ".join(comparison["removed_sections"]))
+                    if latest["has_jd"]:
+                        st.markdown("**Role terms added:**")
+                        tags(comparison["added_terms"])
+                        st.markdown("**Role terms removed:**")
+                        tags(comparison["removed_terms"], missing=True)
+                    if comparison["changed_lines"]:
+                        with st.expander("View text changes"):
+                            st.code("\n".join(comparison["changed_lines"]), language="diff")
+                else:
+                    st.info("Add a revised version to activate comparison.")
+
+            with st.expander("5. Resume-to-job gap coach", expanded=True):
+                rewrites = gap_coach(resume_source, result) if latest["has_jd"] else []
+                if not rewrites:
+                    st.success("No priority role terms are missing from this analysis. Focus on making the evidence behind your strongest matches more specific.")
+                else:
+                    st.caption("Use these as evidence-first templates. Replace every bracketed prompt with a fact from your own experience.")
+                    for term, current, rewrite in rewrites:
+                        st.markdown(f"**Opportunity: {term.title()}**")
+                        st.caption("Starting point from your resume")
+                        st.write(current[:420])
+                        st.caption("Truthful rewrite template")
+                        st.code(rewrite, language=None)
+
+            with st.expander("6. ATS scan simulator"):
+                ats = ats_scan(resume_source, job_source, result)
+                ats_a, ats_b, ats_c = st.columns(3)
+                ats_a.metric("Extracted words", ats["word_count"])
+                ats_b.metric("Role-term mentions", ats["keyword_hits"])
+                ats_c.metric("Keyword density", f"{ats['density']}%")
+                st.caption("Healthy resumes use relevant terms naturally in the summary, skills, and evidence bullets — not in a keyword list.")
+                st.markdown("**Likely parser and scan checks**")
+                for title, detail in ats["issues"]:
+                    st.markdown(f"- **{title}:** {detail}")
+                st.markdown("**Detected ATS-friendly section order**")
+                st.write(" → ".join(ats["section_order"]) if ats["section_order"] else "Use clearly labeled Experience, Education, Skills, and Projects sections.")
+
+            with st.expander("7. Interview question generator"):
+                questions = interview_questions(result) if latest["has_jd"] else []
+                if not questions:
+                    st.info("Add a job description to generate questions tailored to the role.")
+                else:
+                    st.caption("Practice with STAR: Situation, Task, Action, Result. Prepare a real example before answering each question.")
+                    for number, question in enumerate(questions, 1):
+                        st.markdown(f"**{number}.** {question}")
+
+            with st.expander("8. Tailored professional summary"):
+                summary = tailored_summary(result)
+                st.caption("A starting draft — edit it until every statement is accurate, specific, and written in your own voice.")
+                st.text_area("Suggested summary", value=summary, height=130, key="tailored_summary")
+                st.download_button("Download summary (.txt)", summary, file_name="tailored-professional-summary.txt", mime="text/plain", key="download_summary")
+
+            with st.expander("9. Skill roadmap"):
+                roadmap = skill_roadmap(job_source, result) if latest["has_jd"] else []
+                if not roadmap:
+                    st.info("Add a job description to identify the role's requested technical skills and prioritize a roadmap.")
+                else:
+                    st.caption("Priorities are based on skills explicitly mentioned in this job description, not generic market trends.")
+                    for skill, priority, action in roadmap:
+                        st.markdown(f"**{priority} · {skill.title()}**")
+                        st.write(action)
+
+        bottom_left, bottom_right = st.columns([1, 1.3])
+        with bottom_left:
+            st.markdown("#### Detected skills")
+            tags(result["skills"])
+        with bottom_right:
+            st.markdown("#### Skill signal")
+            if result["skills"]:
+                cloud = WordCloud(width=700, height=230, background_color="white", colormap="viridis").generate_from_frequencies({skill: 1 for skill in result["skills"]})
+                figure, axis = plt.subplots(figsize=(8, 2.6))
+                axis.imshow(cloud, interpolation="bilinear")
+                axis.axis("off")
+                st.pyplot(figure, use_container_width=True)
+                plt.close(figure)
+            else:
+                st.info("Add a dedicated Skills section to make technical strengths easier to spot.")
+
+else:
+    st.markdown("<section class='page-intro'><h1>Your progress</h1><p>A private timeline of saved analyses. Use it to see whether your revisions are improving resume quality and role alignment.</p></section>", unsafe_allow_html=True)
+    history = [entry for entry in load_history() if all(key in entry for key in ("timestamp", "file_name", "overall_score", "match_score", "readability"))]
+    if not history:
+        st.info("No saved analyses yet. Your first report will appear here after you analyze a resume.")
     else:
-        st.subheader("Progress Over Time")
-
-        # Prepare data for line charts using *only* valid_history
+        history = sorted(history, key=lambda item: item["timestamp"])
+        latest_entry, previous = history[-1], history[-2] if len(history) > 1 else None
+        st.markdown("#### Latest snapshot")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Latest overall score", f"{latest_entry['overall_score']}/100", delta=(latest_entry["overall_score"] - previous["overall_score"] if previous else None))
+        c2.metric("Latest role match", f"{latest_entry['match_score']}/100", delta=(latest_entry["match_score"] - previous["match_score"] if previous else None))
+        c3.metric("Analyses tracked", len(history))
         try:
             import pandas as pd
-            
-            timestamps = [entry["timestamp"] for entry in valid_history]
-            overall_scores = [entry["overall_score"] for entry in valid_history]
-            match_scores = [entry["match_score"] for entry in valid_history]
-            readability_scores = [entry["readability"] for entry in valid_history]
-            
-            chart_data = pd.DataFrame({
-                'Date': pd.to_datetime(timestamps),
-                'Overall Score': overall_scores,
-                'Match Score': match_scores,
-                'Readability': readability_scores
-            })
-
-            col_chart1, col_chart2 = st.columns(2)
-
-            with col_chart1:
-                st.line_chart(chart_data, x='Date', y=['Overall Score', 'Match Score'], use_container_width=True)
-            
-            with col_chart2:
-                st.line_chart(chart_data, x='Date', y='Readability', use_container_width=True, color="#F39C12")
-
-        except ImportError:
-            st.warning("Install `pandas` for advanced history charts.")
-        except Exception as e:
-            st.error(f"Error generating charts: {e}")
-
-        st.markdown("---")
-        st.subheader("Latest Analysis Entries")
-        
-        # Display history in reverse order (most recent first) using *only* valid_history
-        for i, entry in enumerate(reversed(valid_history)):
-            with st.expander(f"**{entry['timestamp']}** | File: **{entry['file_name']}** | Score: **{entry['overall_score']}%**", expanded=(i==0)):
-                
-                col_h1, col_h2, col_h3 = st.columns(3)
-                
-                with col_h1:
-                    st.metric("Overall Score", f"{entry['overall_score']}%")
-                with col_h2:
-                    st.metric("Match Score", f"{entry['match_score']}%")
-                with col_h3:
-                    st.metric("Readability", entry['readability'])
-                    
-                st.caption(f"**Top Feedback:** {entry['feedback_summary']}")
-                
-                skills_display = entry['top_skills'].keys() if isinstance(entry['top_skills'], dict) else entry.get('top_skills', ['N/A'])
-                st.text(f"Top Skills: {', '.join(skills_display)}")
-        
-        if st.button("Clear History", type="secondary"):
-            history_file.write_text(json.dumps([]))
-            st.success("History cleared!")
-            st.rerun()
+            chart_data = pd.DataFrame(history)
+            chart_data["date"] = pd.to_datetime(chart_data["timestamp"])
+            st.markdown("#### Score trend")
+            st.line_chart(chart_data, x="date", y=["overall_score", "match_score"], use_container_width=True)
+        except Exception:
+            st.caption("Trend chart is unavailable, but your saved entries remain below.")
+        st.markdown("#### All saved reports")
+        st.caption("Every saved analysis is shown here. Open a report below only when you want its full detail.")
+        for entry in reversed(history):
+            timestamp = entry["timestamp"].replace("T", " ")
+            st.markdown(
+                "<div class='history-card'><strong>"
+                + html.escape(entry["file_name"])
+                + "</strong><div class='history-meta'>"
+                + html.escape(timestamp)
+                + " &nbsp;•&nbsp; Overall <b>"
+                + str(entry["overall_score"])
+                + "/100</b> &nbsp;•&nbsp; Role match <b>"
+                + str(entry["match_score"])
+                + "/100</b> &nbsp;•&nbsp; Readability <b>"
+                + str(entry["readability"])
+                + "/100</b></div></div>",
+                unsafe_allow_html=True,
+            )
+        st.markdown("#### Analysis timeline")
+        for index, entry in enumerate(reversed(history)):
+            timestamp = entry["timestamp"].replace("T", " ")
+            with st.expander(f"{entry['file_name']}  ·  {entry['overall_score']}/100  ·  {timestamp}", expanded=index == 0):
+                a, b, c = st.columns(3)
+                a.metric("Overall", f"{entry['overall_score']}/100")
+                b.metric("Role match", f"{entry['match_score']}/100")
+                c.metric("Readability", f"{entry['readability']}/100")
+                st.caption(entry.get("feedback_summary", "No summary saved."))
+                tags(entry.get("top_skills", []))
+        st.divider()
+        export, clear = st.columns(2)
+        with export:
+            st.markdown("**Keep a copy of your progress**")
+            st.caption("Download your complete private history before deleting anything.")
+            st.download_button("Export history (.json)", json.dumps(history, indent=2), file_name="resume-insight-history.json", mime="application/json")
+        with clear:
+            st.markdown("<div class='danger-zone'><strong>Clear saved history</strong><span>This permanently removes all saved reports and the current analysis from this local app.</span></div>", unsafe_allow_html=True)
+            confirm_clear = st.checkbox("I understand this cannot be undone", key="confirm_clear_history")
+            if st.button("Permanently clear history", type="secondary", disabled=not confirm_clear, use_container_width=True, key="clear_history_button"):
+                HISTORY_PATH.write_text("[]", encoding="utf-8")
+                st.session_state.pop("latest_analysis", None)
+                st.toast("Saved history cleared", icon="✅")
+                st.rerun()
